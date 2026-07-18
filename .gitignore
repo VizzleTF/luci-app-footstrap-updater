@@ -1,0 +1,19 @@
+# build artifacts
+*.apk
+*.ipk
+/bin/
+dist/
+
+# editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# lint/CI tooling only — never shipped (see package.json). package-lock.json IS committed on
+# purpose: it pins the transitive dependency tree CI lints with.
+node_modules/
+
+# python bytecode
+__pycache__/
+*.pyc

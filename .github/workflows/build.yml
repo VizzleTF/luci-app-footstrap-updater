@@ -1,0 +1,331 @@
+name: Build luci-app-footstrap-updater
+
+# Noarch package (LUCI_PKGARCH:=all): one build per format covers every target.
+#   apk — OpenWrt 25.12+ (latest 25.12.x SDK) ; ipk — OpenWrt 24.10 (latest 24.10.x SDK)
+#
+# Since the theme/updater split this repo builds and releases the updater ALONE, with its own tags.
+# The updater DEPENDS on +luci-theme-footstrap, so the build clones the theme repo into the SDK feed
+# purely to resolve that dependency — only the updater asset is uploaded.
+on:
+  push:
+    tags: ['v*']
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # the theme repo, cloned in the build job only to satisfy +luci-theme-footstrap
+  THEME_REPO: https://github.com/VizzleTF/luci-theme-footstrap
+  THEME_REF: main
+
+jobs:
+  check:
+    name: Static checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Shell syntax
+        run: |
+          set -eu
+          for f in install.sh tools/*.sh \
+                   luci-app-footstrap-updater/*.sh \
+                   luci-app-footstrap-updater/root/usr/libexec/*.sh; do
+            [ -f "$f" ] || continue
+            sh -n "$f" || { echo "syntax error: $f"; exit 1; }
+          done
+
+      - name: The SDK can see the package at all
+        run: sh tools/scan-marker.sh
+
+      # rpcd SKIPS an acl.d file it cannot parse and says nothing: a trailing comma means the file.exec
+      # grant is given to nobody, and the Update button dies for every user with no build error.
+      - name: rpcd ACL is valid JSON
+        run: |
+          set -eu
+          for f in luci-app-footstrap-updater/root/usr/share/rpcd/acl.d/*.json; do
+            python3 -m json.tool "$f" >/dev/null || { echo "invalid JSON: $f"; exit 1; }
+            echo "ok: $f"
+          done
+
+      # The release public key exists TWICE and neither copy can go: the package ships it (the
+      # self-updater reads it off disk) and install.sh embeds it (it runs from `curl | sh` before any
+      # package exists). A divergence looks exactly like the attack the key stops — the installer would
+      # reject every release with "BAD SIGNATURE" — so compare them. One key signs theme + updater.
+      - name: The installer embeds the key the package ships
+        run: |
+          set -eu
+          pub=luci-app-footstrap-updater/root/usr/share/luci-app-footstrap-updater/release.pub
+          want=$(grep -v '^untrusted comment:' "$pub" | tr -d '\n')
+          [ -n "$want" ] || { echo "no key line in $pub"; exit 1; }
+          got=$(grep -oE 'RW[A-Za-z0-9+/=]{40,}' install.sh | sort -u)
+          [ "$got" = "$want" ] || {
+            echo "install.sh embeds a different release key than the package ships"
+            echo "  package:   $want"
+            echo "  installer: ${got:-<none>}"
+            exit 1
+          }
+          echo "release key matches in both copies."
+
+      # A _() string with no translation renders in English, silently. Fails if the .pot is stale or a
+      # msgstr is empty.
+      - name: i18n (translation catalogue current and complete)
+        run: |
+          sudo apt-get update && sudo apt-get install -y gettext
+          luci-app-footstrap-updater/update-po.sh --check
+
+  lint:
+    name: Lint + JS safety
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+
+      - name: ESLint (updater JS)
+        run: npm run lint:js
+
+      # @mirror: install.sh and footstrap-selfupdate.sh cannot share a file (the installer is
+      # `curl | sh` and runs before the package that would hold a library exists), so their fetch /
+      # host-allowlist / asset-lookup / verify-sig helpers are pinned byte-identical.
+      - name: "@mirror (pinned duplication stays byte-identical)"
+        run: npm run mirror
+
+      - name: Changelog contract
+        run: npm run changelog
+
+      # THE GATE THAT MAKES SHIPPING MINIFIED JS SAFE. luci.mk minifies fs-update.js with jsmin, whose
+      # regex-vs-division test is a ONE-char lookback: `return /re/` can make it swallow the rest of the
+      # file WHILE EXITING 0 (openwrt/luci#8299). Build the exact jsmin from the pinned luci-base source
+      # and prove the minified output is token-identical to the source. eslint's wrap-regex stops the
+      # shape being written; this proves it never got through. Pinned by commit + sha256 (luci-upstream.pin).
+      - name: Build jsmin (the same one the buildbot uses)
+        run: |
+          set -eu
+          . ./luci-upstream.pin
+          curl -fsSL --proto '=https' --proto-redir '=https' -o /tmp/jsmin.c \
+            "https://raw.githubusercontent.com/openwrt/luci/$LUCI_PIN/modules/luci-base/src/jsmin.c"
+          echo "$JSMIN_SHA256  /tmp/jsmin.c" | sha256sum -c -
+          cc -O2 -o /tmp/jsmin /tmp/jsmin.c
+
+      - name: jsmin equivalence (minified JS must be the same program)
+        env:
+          JSMIN: /tmp/jsmin
+        run: |
+          set -eu
+          files=$(find luci-app-footstrap-updater/htdocs -name '*.js' | sort | tr '\n' ' ')
+          [ -n "$files" ] || { echo "found no shipped JS"; exit 1; }
+          node tools/jsmin-verify.mjs $files
+
+  build:
+    needs: [check, lint]
+    name: Build ${{ matrix.fmt }} (${{ matrix.channel }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - fmt: apk
+            channel: '25.12'
+            fallback: '25.12.5'
+            use_apk: 'y'
+            sdk_key: 'b5043e70f9a75cde'
+            sdk_key_sha256: 'd7ac10f9ed1b38033855f3d27c9327d558444fca804c685b17d9dcfb0648228f'
+          - fmt: ipk
+            channel: '24.10'
+            fallback: '24.10.4'
+            use_apk: 'n'
+            sdk_key: 'd310c6f2833e97f7'
+            sdk_key_sha256: 'e3624aa9be785362a172595b4919b233268871c4365a9b8da2b42ac41745ad95'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Resolve package version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "FOOTSTRAP_VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_ENV"
+          else
+            echo "FOOTSTRAP_VERSION=0.$(date +%y%m%d).${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Clone the theme (dependency resolution only)
+        run: git clone --depth 1 --branch "$THEME_REF" "$THEME_REPO" "$RUNNER_TEMP/theme"
+
+      - name: Install host tools
+        run: sudo apt-get update && sudo apt-get install -y zstd xz-utils rsync
+
+      - name: Download OpenWrt SDK
+        run: |
+          set -euo pipefail
+          CH_RE="$(printf '%s' '${{ matrix.channel }}' | sed 's/\./\\./g')"
+          LATEST="$(curl -sfL 'https://downloads.openwrt.org/releases/' \
+            | grep -oE "${CH_RE}\.[0-9]+" | sort -V | uniq | tail -n1)" || LATEST=''
+          [ -n "$LATEST" ] || { LATEST='${{ matrix.fallback }}'; echo "release listing failed; falling back"; }
+          echo "Using OpenWrt release: $LATEST"
+          BASE="https://downloads.openwrt.org/releases/$LATEST/targets/x86/64"
+
+          SDK_FILE="$(curl -sfL "$BASE/" | grep -oE 'openwrt-sdk-[^"<]+\.tar\.(zst|xz)' | head -n1)" || SDK_FILE=''
+          [ -n "$SDK_FILE" ] || { echo "SDK filename not found at $BASE"; exit 1; }
+          echo "Using SDK: $SDK_FILE"
+          curl -fL --proto '=https' --proto-redir '=https' "$BASE/$SDK_FILE" -o "$RUNNER_TEMP/sdk.tar"
+
+          # Verify the SDK: signature first (a key pinned from github.com/openwrt/keyring, a DIFFERENT
+          # host than downloads.openwrt.org, so the download host cannot vouch for itself), then the
+          # checksum under it. The two branches do NOT share a signing key. See luci-upstream.pin.
+          . luci-upstream.pin
+          U="$(tools/build-usign.sh "$RUNNER_TEMP/usign")"
+
+          curl -sfL --proto '=https' --proto-redir '=https' "$BASE/sha256sums" -o "$RUNNER_TEMP/sha256sums"
+          curl -sfL --proto '=https' --proto-redir '=https' "$BASE/sha256sums.sig" -o "$RUNNER_TEMP/sha256sums.sig"
+          curl -sfL --proto '=https' --proto-redir '=https' \
+            "https://raw.githubusercontent.com/openwrt/keyring/$OPENWRT_KEYRING_PIN/usign/${{ matrix.sdk_key }}" \
+            -o "$RUNNER_TEMP/openwrt.pub"
+          echo "${{ matrix.sdk_key_sha256 }}  $RUNNER_TEMP/openwrt.pub" | sha256sum -c - \
+            || { echo "OpenWrt's ${{ matrix.channel }} key does not match its pin — refusing"; exit 1; }
+
+          "$U" -V -m "$RUNNER_TEMP/sha256sums" -p "$RUNNER_TEMP/openwrt.pub" -x "$RUNNER_TEMP/sha256sums.sig" \
+            || { echo "BAD SIGNATURE on OpenWrt's sha256sums — refusing to build with this SDK."; \
+                 echo "keynum the signature names:"; \
+                 sed -n 2p "$RUNNER_TEMP/sha256sums.sig" | base64 -d | xxd -s2 -l8 -p; \
+                 echo "matrix.sdk_key: ${{ matrix.sdk_key }}"; exit 1; }
+          echo "OpenWrt sha256sums: signature verified with ${{ matrix.sdk_key }}."
+
+          WANT="$(grep -F " *$SDK_FILE" "$RUNNER_TEMP/sha256sums" | cut -d' ' -f1)" || WANT=''
+          [ -n "$WANT" ] || { echo "no sha256 published for $SDK_FILE"; exit 1; }
+          GOT="$(sha256sum "$RUNNER_TEMP/sdk.tar" | cut -d' ' -f1)"
+          [ "$WANT" = "$GOT" ] || { echo "SDK checksum mismatch: want $WANT, got $GOT"; exit 1; }
+          echo "SDK sha256 verified against the signed list."
+
+          case "$SDK_FILE" in
+            *.zst) tar --zstd -xf "$RUNNER_TEMP/sdk.tar" -C "$RUNNER_TEMP" ;;
+            *.xz)  tar -xJf   "$RUNNER_TEMP/sdk.tar" -C "$RUNNER_TEMP" ;;
+          esac
+          SDK_DIR="$(find "$RUNNER_TEMP" -maxdepth 1 -type d -name 'openwrt-sdk*' | head -n1)"
+          [ -n "$SDK_DIR" ] || { echo "SDK dir not found"; exit 1; }
+          echo "SDK_DIR=$SDK_DIR" >> "$GITHUB_ENV"
+
+      - name: Build package
+        working-directory: ${{ env.SDK_DIR }}
+        run: |
+          set -euo pipefail
+          # both package dirs into the SDK: the updater (this repo) is what we ship; the theme (cloned)
+          # is present ONLY so +luci-theme-footstrap resolves. Only the updater asset is uploaded.
+          mkdir -p package/luci-app-footstrap-updater package/luci-theme-footstrap
+          rsync -a --delete "$GITHUB_WORKSPACE/luci-app-footstrap-updater/" package/luci-app-footstrap-updater/
+          rsync -a --delete "$RUNNER_TEMP/theme/luci-theme-footstrap/" package/luci-theme-footstrap/
+
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          echo 'CONFIG_PACKAGE_luci-app-footstrap-updater=m' >> .config
+          if [ "${{ matrix.use_apk }}" = "y" ]; then
+            echo 'CONFIG_USE_APK=y' >> .config
+          fi
+          make defconfig
+          make package/luci-app-footstrap-updater/compile V=s FOOTSTRAP_VERSION="$FOOTSTRAP_VERSION"
+
+          # The translation catalogue is compiled INTO the package (Build/Prepare -> po2lmo); a silently
+          # missing .lmo ships the updater untranslated. Assert it exists in the staged tree.
+          find build_dir -name 'footstrap-updater.*.lmo' | grep -q . || {
+            echo "no footstrap-updater.<lang>.lmo — the updater would ship untranslated"; exit 1
+          }
+
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          find bin/ -type f \( -name 'luci-app-footstrap-updater-*.apk' -o -name 'luci-app-footstrap-updater_*.ipk' \) \
+            -exec cp {} "$GITHUB_WORKSPACE/dist/" \;
+          ls -lah "$GITHUB_WORKSPACE/dist"
+
+          # EXACTLY ONE updater asset per format, by NAME. A self-updater in the field resolves the
+          # updater by /luci-app-footstrap-updater[-_][^/]*\.EXT$/ and takes head -1, so a stray extra
+          # asset matching that regex would be mis-picked (issue #6). Named-and-counted stops that.
+          n=$(ls "$GITHUB_WORKSPACE/dist" | grep -cE "^luci-app-footstrap-updater[-_][^/]*\.${{ matrix.fmt }}$" || true)
+          [ "$n" = 1 ] || { echo "expected exactly 1 updater .${{ matrix.fmt }}, got $n"; ls "$GITHUB_WORKSPACE/dist"; exit 1; }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: luci-app-footstrap-updater-${{ matrix.fmt }}
+          path: dist/*.${{ matrix.fmt }}
+          if-no-files-found: error
+
+  release:
+    name: Attach package to release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      # SIGN. The one step that vouches for the bytes a router installs. Detached usign signature, not
+      # apk's own: putting our key in /etc/apk/keys would make footstrap a trust anchor for everything
+      # the router installs; opkg cannot verify a standalone .ipk at all. The key is a GitHub Actions
+      # secret (SAME key as the theme repo, so the one release.pub verifies both), unreadable back out,
+      # so a replaced asset with a recomputed sha256 still fails here. Lives in the RELEASE job — the
+      # build job also runs on pull_request, and a secret must never be reachable from a fork.
+      - name: Sign the packages
+        env:
+          FOOTSTRAP_USIGN_KEY: ${{ secrets.FOOTSTRAP_USIGN_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "${FOOTSTRAP_USIGN_KEY:-}" ] || {
+            echo "FOOTSTRAP_USIGN_KEY is not set — a release without a signature is one no current"
+            echo "installer will accept. Refusing to publish."
+            exit 1
+          }
+          U="$(tools/build-usign.sh "$RUNNER_TEMP/usign")"
+          umask 077
+          printf '%s' "$FOOTSTRAP_USIGN_KEY" | base64 -d > "$RUNNER_TEMP/sec.key"
+          trap 'shred -u "$RUNNER_TEMP/sec.key" 2>/dev/null || rm -f "$RUNNER_TEMP/sec.key"' EXIT
+
+          pub=luci-app-footstrap-updater/root/usr/share/luci-app-footstrap-updater/release.pub
+          n=0
+          for p in $(find dist -maxdepth 1 -type f \( -name '*.apk' -o -name '*.ipk' \) | sort); do
+            "$U" -S -m "$p" -s "$RUNNER_TEMP/sec.key" -x "$p.sig"
+            "$U" -V -q -m "$p" -x "$p.sig" -p "$pub" || {
+              echo "signature does not verify against $pub — the secret and the shipped key disagree"
+              exit 1
+            }
+            echo "signed + verified: $(basename "$p")"
+            n=$((n + 1))
+          done
+          # 2 packages: the updater in each of apk and ipk. One key signs them.
+          [ "$n" -ge 2 ] || { echo "expected both packages to sign, signed $n"; exit 1; }
+
+          # Re-check the name-anchored one-asset invariant on the FINAL set (a .sig ends in .EXT.sig, so
+          # it never matches `…\.EXT$`). A fielded self-updater picks the updater by this regex + head -1.
+          for ext in apk ipk; do
+            re="^luci-app-footstrap-updater[-_][^/]*\.$ext$"
+            n=$(ls dist | grep -cE "$re") || true
+            [ "$n" = 1 ] || { echo "a fielded self-updater matching /$re/ would pick $n assets, want 1:"; ls dist | grep -E "$re" || true; exit 1; }
+          done
+          ls -l dist
+
+      - name: Build release notes from the CHANGELOG
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          sh tools/release-notes.sh "$ver" > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+
+      # Pinned by COMMIT, not the v3 tag: the only third-party action, in the only job holding
+      # contents: write. It never sees the signing secret (step-scoped env). (= tag v3.)
+      - name: Attach to release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228
+        with:
+          files: dist/*
+          body_path: ${{ runner.temp }}/notes.md

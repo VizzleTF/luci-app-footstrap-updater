@@ -1,0 +1,19 @@
+{
+  "name": "luci-app-footstrap-updater-tooling",
+  "private": true,
+  "description": "Lint/CI tooling only. NOTHING here is shipped: luci.mk copies htdocs/ and root/ verbatim and never invokes node. These devDependencies exist for CI and local checks.",
+  "scripts": {
+    "lint": "npm run lint:js",
+    "lint:js": "eslint luci-app-footstrap-updater/htdocs",
+    "i18n": "luci-app-footstrap-updater/update-po.sh --check",
+    "mirror": "node tools/mirror.mjs",
+    "changelog": "node tools/changelog.mjs",
+    "check": "npm run lint && npm run mirror && npm run changelog && npm run i18n"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@stylistic/eslint-plugin": "^5.10.0",
+    "eslint": "^10.7.0",
+    "globals": "^17.7.0"
+  }
+}

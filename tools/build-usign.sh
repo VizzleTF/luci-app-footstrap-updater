@@ -14,7 +14,7 @@ set -eu
 dest="${1:?usage: build-usign.sh <dir>}"
 here="$(cd "$(dirname "$0")/.." && pwd)"
 
-. "$here/luci-theme-footstrap/luci-upstream.pin"
+. "$here/luci-upstream.pin"
 [ -n "${USIGN_PIN:-}" ] || { echo "USIGN_PIN missing from luci-upstream.pin" >&2; exit 1; }
 
 git clone -q https://github.com/openwrt/usign "$dest"

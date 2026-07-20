@@ -87,7 +87,8 @@ function fsVerCmp(a, b) {
  * behind (do_update skips the current one). The returned shape keeps `current`/`latest`/`hasUpdate`
  * for the theme's fs-appearance.js, which never learns there is a second package — it just reads
  * hasUpdate for the badge; the updater fields drive only this module's own confirm dialog. */
-function tagOf(res) { const o = String((res && res.stdout) || '').trim(); return (/^v?\d/).test(o) ? o : null; }
+function stdoutOf(res) { return String((res && res.stdout) || '').trim(); }
+function tagOf(res) { const o = stdoutOf(res); return (/^v?\d/).test(o) ? o : null; }
 function checkFootstrapUpdate() {
 	if (_fsUpdatePromise) return _fsUpdatePromise;
 	if (!currentUpdateCheck() || (!ver.isReal() && !updIsReal()))
@@ -134,7 +135,7 @@ const FS_NOTES_MAX = 4000;	/* cap on the untrusted release body we render */
 function fetchNotes() {
 	return window.L.require('fs')
 		.then((fs) => fs.exec(FS_UPDATE_SCRIPT, [ 'notes' ]))
-		.then((res) => String((res && res.stdout) || '').trim().slice(0, FS_NOTES_MAX))
+		.then((res) => stdoutOf(res).slice(0, FS_NOTES_MAX))
 		.catch(() => '');
 }
 
@@ -223,7 +224,7 @@ function runSelfUpdate() {
 		return fs.exec(FS_UPDATE_SCRIPT, [ 'status' ]).then((res) => {
 			/* the RPC was in flight while the user navigated: drop it on the floor */
 			if (stale()) return;
-			const out = String((res && res.stdout) || '').trim();
+			const out = stdoutOf(res);
 			if ((/^OK$/).test(out)) {
 				modal([ E('p', {}, _('Updated. Reloading…')) ]);
 				window.setTimeout(() => location.reload(), 1200);
@@ -245,7 +246,7 @@ function runSelfUpdate() {
 		window.L.require('fs')
 			.then((fs) => fs.exec(FS_UPDATE_SCRIPT).then((res) => {
 				if (stale()) return;
-				const out = String((res && res.stdout) || '').trim();
+				const out = stdoutOf(res);
 				if (!(/^(STARTED|RUNNING)$/).test(out))
 					return fail((res && (res.stderr || res.stdout)) || '');
 				poll(fs, Date.now() + FS_UPDATE_LIMIT_MS);

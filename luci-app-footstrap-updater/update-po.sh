@@ -15,8 +15,17 @@ set -eu
 
 cd "$(dirname "$0")"
 
-# luci-upstream.pin lives at this repo's root — one source of the luci commit + scanner checksum.
-. ../luci-upstream.pin
+# luci-upstream.pin is the one source of the luci commit + scanner checksum, and WHICH repo this
+# package sits in decides where it is: at the root in the updater's own repo, inside the theme package
+# dir while the theme repo builds the transition release. Both are tried rather than one being picked,
+# so this file stays identical in the two checkouts — the alternative is a one-line divergence that
+# nothing can pin and that breaks the i18n gate in whichever repo was edited second.
+_pin=''
+for _p in ../luci-upstream.pin ../luci-theme-footstrap/luci-upstream.pin; do
+	[ -f "$_p" ] && { _pin="$_p"; break; }
+done
+[ -n "$_pin" ] || { echo "update-po: luci-upstream.pin not found (looked beside and in the theme package)" >&2; exit 1; }
+. "$_pin"
 SCANNER_URL="https://raw.githubusercontent.com/openwrt/luci/${LUCI_PIN}/build/i18n-scan.pl"
 SCANNER_SHA256="$I18N_SCAN_SHA256"
 POT='i18n/templates/footstrap-updater.pot'

@@ -10,7 +10,7 @@ Deprecated, Removed, Fixed, Security, Performance — one of each per release.
 
 Every commit writes into `[Unreleased]`. Cutting a tag renames that heading.
 
-## [Unreleased]
+## [1.0.0] — 2026-07-22
 
 ### Added
 
@@ -34,9 +34,30 @@ Every commit writes into `[Unreleased]`. Cutting a tag renames that heading.
   (carried over). It sums the asset sizes the API publishes and checks the tmpfs the download lands in
   and the overlay it unpacks into; it fails open, since space is not a security property.
 
+### Changed
+
+- **The updater resolves itself from this repo first and falls back to the theme's release while this
+  repo has nothing to offer.** One resolver (`resolve_updater()`) now answers "where does the updater
+  come from", and both the install and the badge go through it — a badge reading one source while the
+  install reads another either offers an update that never happens or hides one that does. This repo
+  wins whenever it publishes an asset, whatever the versions say, so the day it cuts its first release
+  is the day every router crosses over with no second decision anywhere. Until then the theme's
+  transition release carries a signed updater asset, and that is what gets installed: the same ed25519
+  key verifies both sources, so the fallback changes where the bytes come from and never whether they
+  are checked. On the fallback path the version comes from the asset FILE NAME (`asset_ver()`, both apk
+  and ipk naming) — a theme release's `tag_name` is the theme's version, not this package's.
+  **This repo's first tag must be higher than the transition build's version**: opkg refuses a
+  downgrade by default ("Not downgrading package …"), exits 0 and installs nothing, so a lower tag
+  would strand every 24.10 router on the transition build while reporting success.
+- **`$EXT` is resolved once at top level instead of inside `do_update`.** `check-updater` resolves an
+  asset too now, and with `$EXT` unset `asset_urls` grepped for a name ending in a bare dot — matching
+  nothing, i.e. a silent "no update available" on every router.
+
 ### Fixed
 
 - **A failing updater refresh no longer reports the whole update as failed after the theme has already
   installed** (carried over). `fetch_verify_install` installs nothing on a verify failure, so the old
   updater stays intact to retry, and the run finalises (drops caches, writes `OK`, the client reloads)
   once the theme is in.
+
+[1.0.0]: https://github.com/VizzleTF/luci-app-footstrap-updater/commits/v1.0.0

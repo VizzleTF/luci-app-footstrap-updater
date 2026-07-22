@@ -61,14 +61,25 @@ CACHE_TTL=300
 # TWO repos since the split: the theme and the updater ship from their own GitHub repos, each with its
 # own tags and release stream. `check`/`notes` (the badge + the confirm dialog) are about the THEME —
 # that is what the user updates — so they hit the theme repo. do_update installs BOTH: the theme from
-# its repo, the updater from its own, each verified against the same key (one release.pub). The updater
-# leg is SKIPPED when the installed version already matches the latest updater tag ("use the existing
-# one"), so an unchanged updater is neither downloaded nor reinstalled.
+# its repo, the updater from the updater repo when it offers an asset and from the THEME release when
+# it does not (resolve_updater — read it before touching either leg), each verified against the same
+# key (one release.pub). The updater leg is SKIPPED when the installed version already matches the
+# resolved one ("use the existing one"), so an unchanged updater is neither downloaded nor reinstalled.
 REPO_THEME="VizzleTF/luci-theme-footstrap"
 REPO_UPDATER="VizzleTF/luci-app-footstrap-updater"
 API_THEME="https://api.github.com/repos/${REPO_THEME}/releases/latest"
 API_UPDATER="https://api.github.com/repos/${REPO_UPDATER}/releases/latest"
 PKG_UPDATER="luci-app-footstrap-updater"
+
+# Which package manager this router runs — apk on 25.12+, opkg on 24.10 — and therefore which asset
+# extension asset_urls looks for. Resolved ONCE, at top level, NOT inside do_update: `check-updater`
+# resolves an asset too (its fallback picks the updater out of the theme release, by name AND
+# extension), and an unset $EXT there leaves asset_urls grepping for a name ending in a bare dot, which
+# matches nothing — a silent "no update available" on every router.
+if command -v apk >/dev/null 2>&1; then EXT="apk"
+elif command -v opkg >/dev/null 2>&1; then EXT="ipk"
+else EXT=""
+fi
 
 # The release public key, shipped BY THIS PACKAGE. Read from disk rather than embedded, so the key
 # travels with the code that trusts it: a key rotation is then one file in one release, and the router
@@ -183,6 +194,59 @@ installed_ver() {	# <pkg> -> installed version, or empty (not installed / manage
 	elif command -v opkg >/dev/null 2>&1; then
 		opkg status "$1" 2>/dev/null | sed -n 's/^Version: *//p' | head -n1
 	fi
+}
+
+# The version an asset carries in its FILE NAME. Needed only on the FALLBACK path below, where the
+# updater asset is picked out of the THEME release: that release's `tag_name` is the THEME's version,
+# so the updater's own version can only come from the file name. Both naming schemes are handled —
+# apk `name-0.9.4-r1.apk`, ipk `name_0.9.4-r1_all.ipk` — and the `-rN` release suffix is stripped, so
+# the result compares against installed_ver() on the same footing as a bare release tag.
+asset_ver() {		# <asset url> -> 0.9.4 (empty if the name does not parse)
+	_n="${1##*/}"
+	_n="${_n#"$PKG_UPDATER"}"; _n="${_n#-}"; _n="${_n#_}"
+	_n="${_n%%_*}"			# ipk: drop the `_all.ipk` arch tail
+	_n="${_n%.apk}"; _n="${_n%.ipk}"
+	case "$_n" in [0-9]*) ver_base "$_n" ;; *) echo "" ;; esac
+}
+
+# WHERE THE UPDATER COMES FROM, and why there are two answers.
+#
+# Since the split the updater's home is its OWN repo — that is the primary source and the one every
+# future release comes from. But the theme repo published the updater as well up to and including the
+# transition release, and the fallback here is what makes the move survivable in BOTH directions:
+#
+#  - the updater repo has no release yet (that is the state this fallback was written for), so a
+#    router that installed the transition updater would otherwise never see an updater update at all;
+#  - the updater repo is unreachable, renamed or its release is broken — the theme release is a
+#    second, already-fetched place to look, at no extra API call.
+#
+# It is deliberately NOT a preference: the updater repo WINS whenever it offers an asset, whatever the
+# versions say, so the day it publishes is the day every router moves onto it. The version comparison
+# stays with the caller (both callers do it differently: do_update skips an equal version, the client
+# badge wants strictly-newer).
+#
+# Sets U_JSON (the release json that LISTS the asset — its digest and .sig live there, so the caller
+# must verify against THIS json, not against whichever it happened to fetch) and U_VER. Returns 1 when
+# neither source offers an updater package, which every caller treats as "nothing to do", never as an
+# error: an absent updater asset is the normal state of a theme-only release.
+resolve_updater() {	# <theme-release-json|""> <fetch-timeout>
+	U_JSON=""; U_VER=""
+	if fetch "$API_UPDATER" "$2" "$WD/updater.json"; then
+		_t="$(jsonfilter -i "$WD/updater.json" -e '@.tag_name' 2>/dev/null)"
+		if [ -n "$_t" ] && [ -n "$(asset_urls "$WD/updater.json" "$PKG_UPDATER" | head -1)" ]; then
+			U_JSON="$WD/updater.json"; U_VER="$(ver_base "${_t#v}")"
+			return 0
+		fi
+	fi
+	rm -f "$WD/updater.json"
+
+	[ -n "$1" ] && [ -f "$1" ] || return 1
+	_u="$(asset_urls "$1" "$PKG_UPDATER" | head -1)"
+	[ -n "$_u" ] || return 1
+	U_VER="$(asset_ver "$_u")"
+	[ -n "$U_VER" ] || return 1
+	U_JSON="$1"
+	return 0
 }
 
 # NOT @mirror'd: install.sh installs one known release and never sums asset sizes, so this has no
@@ -323,15 +387,11 @@ check_space() {
 }
 
 do_update() {
-	if command -v apk >/dev/null 2>&1; then
-		EXT="apk"
-		install_pkg() { apk add --allow-untrusted "$1"; }
-	elif command -v opkg >/dev/null 2>&1; then
-		EXT="ipk"
-		install_pkg() { opkg install "$1"; }
-	else
-		echo "ERR: no apk or opkg found" > "$STATUS"; return 1
-	fi
+	case "$EXT" in
+		apk) install_pkg() { apk add --allow-untrusted "$1"; } ;;
+		ipk) install_pkg() { opkg install "$1"; } ;;
+		*) echo "ERR: no apk or opkg found" > "$STATUS"; return 1 ;;
+	esac
 
 	# --- THEME: from the theme repo -------------------------------------------------------------
 	# The theme is the essential package and the one the user updates. Resolved by NAME, never by a bare
@@ -345,28 +405,33 @@ do_update() {
 		rm -f "$tjson"; return 1
 	}
 
-	# --- UPDATER: from its OWN repo, SKIPPED when already current --------------------------------
-	# Since the split the updater ships from its own repo with its own tags. Compare the latest updater
-	# tag against the installed version (release suffix stripped): equal -> use the existing one, so an
-	# unchanged updater is neither downloaded nor reinstalled. Optional in BOTH directions — a missing
-	# asset or an unreachable updater repo is skipped, and a present-but-failing install is non-fatal
-	# once the theme is in (below). ORDER: theme first, updater second — the updater package overwrites
-	# THIS running script, which is why the worker runs from a staged copy ($WORKER, see the "" branch).
-	ujson="$WD/updater.json"
+	# --- UPDATER: its own repo first, the theme release as fallback, SKIPPED when already current ---
+	# resolve_updater() decides WHERE (see it for why there are two sources); here we decide WHETHER.
+	# Equal versions -> use the existing one, so an unchanged updater is neither downloaded nor
+	# reinstalled. Optional in BOTH directions — nothing to resolve is skipped, and a present-but-failing
+	# install is non-fatal once the theme is in (below). ORDER: theme first, updater second — the updater
+	# package overwrites THIS running script, which is why the worker runs from a staged copy ($WORKER,
+	# see the "" branch).
+	#
+	# The version compare is `!=`, not "newer than": the resolved source is authoritative. That is what
+	# lets a router move from the transition updater (built and published by the THEME repo) onto the
+	# updater repo's own stream. The updater repo's first tag is therefore HIGHER than the transition
+	# build's version, and has to be — opkg refuses a downgrade by default ("Not downgrading package …"),
+	# exits 0 and installs nothing, so a lower tag there would strand every 24.10 router on the
+	# transition build while reporting success.
 	updater_url=""
-	if fetch "$API_UPDATER" 20 "$ujson"; then
-		utag="$(jsonfilter -i "$ujson" -e '@.tag_name' 2>/dev/null)"
-		if [ -n "$utag" ] && [ "$(ver_base "${utag#v}")" != "$(ver_base "$(installed_ver "$PKG_UPDATER")")" ]; then
-			updater_url="$(asset_urls "$ujson" "$PKG_UPDATER" | head -1)"
-		fi
+	if resolve_updater "$tjson" 20; then
+		[ "$U_VER" != "$(ver_base "$(installed_ver "$PKG_UPDATER")")" ] &&
+			updater_url="$(asset_urls "$U_JSON" "$PKG_UPDATER" | head -1)"
 	fi
 
 	# Free space, before any download, so a short device fails with a clear cause instead of a
-	# half-written tree. Each asset is measured against the json that lists it.
-	check_space "$tjson" "$theme_url" || { rm -f "$tjson" "$ujson"; return 1; }
-	[ -n "$updater_url" ] && { check_space "$ujson" "$updater_url" || { rm -f "$tjson" "$ujson"; return 1; }; }
+	# half-written tree. Each asset is measured against the json that LISTS it — which for the updater is
+	# $U_JSON, and that may be $tjson itself on the fallback path.
+	check_space "$tjson" "$theme_url" || { rm -f "$tjson" "$WD/updater.json"; return 1; }
+	[ -n "$updater_url" ] && { check_space "$U_JSON" "$updater_url" || { rm -f "$tjson" "$WD/updater.json"; return 1; }; }
 
-	fetch_verify_install "$theme_url" "$tjson" || { rm -f "$tjson" "$ujson"; return 1; }
+	fetch_verify_install "$theme_url" "$tjson" || { rm -f "$tjson" "$WD/updater.json"; return 1; }
 
 	# The theme (the essential package) is now on disk. A failing updater refresh must NOT strand it
 	# behind stale caches: fetch_verify_install installs NOTHING on a verify failure — the old,
@@ -377,9 +442,9 @@ do_update() {
 	# visibly applied. Re-assert RUNNING so a poll landing between the transient ERR fetch_verify_install
 	# wrote and the OK below never sees it.
 	if [ -n "$updater_url" ]; then
-		fetch_verify_install "$updater_url" "$ujson" || echo "RUNNING" > "$STATUS"
+		fetch_verify_install "$updater_url" "$U_JSON" || echo "RUNNING" > "$STATUS"
 	fi
-	rm -f "$tjson" "$ujson"
+	rm -f "$tjson" "$WD/updater.json"
 
 	# drop the LuCI menu/dispatch + module caches so the new theme is served at once
 	rm -f /tmp/luci-indexcache* 2>/dev/null
@@ -437,8 +502,14 @@ check-updater)
 			echo "$tag"; exit 0
 		fi
 	fi
-	tag="$(fetch "$API_UPDATER" 10 | jsonfilter -e '@.tag_name' 2>/dev/null)"
-	[ -n "$tag" ] || { echo "ERR: cannot reach the GitHub release API"; exit 1; }
+	# Resolved through the SAME resolver do_update uses, and that is the point: a badge that reads one
+	# source while the install reads another either offers an update that does not happen or hides one
+	# that does. On the fallback path the version comes out of the asset FILE NAME (the theme release's
+	# tag_name is the theme's version, not this package's) — so the theme release json has to be at hand;
+	# $APIJSON is the one `check` already cached, and it is fetched here only if that has not happened.
+	[ -f "$APIJSON" ] || fetch "$API_THEME" 10 "$APIJSON" >/dev/null 2>&1
+	resolve_updater "$APIJSON" 10 || { echo "ERR: cannot reach the GitHub release API"; exit 1; }
+	tag="v$U_VER"
 	echo "$now $tag" > "$UCACHE"
 	echo "$tag"
 	exit 0

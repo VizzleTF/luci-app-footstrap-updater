@@ -252,16 +252,30 @@ if [ -z "$THEME_URL" ]; then
 fi
 
 # The updater ships from its OWN repo, always its own latest — the theme tag does not pin it. It is
-# OPTIONAL: an unreachable updater repo or a release with no updater asset is a warning, not a
-# failure, since the theme alone is a complete install. Named separately, never by a bare `\.$EXT$`
-# glob — a self-updater in the field picks each package by its own name (issue #6).
+# OPTIONAL: nothing to resolve is a warning, not a failure, since the theme alone is a complete
+# install. Named separately, never by a bare `\.$EXT$` glob — a self-updater in the field picks each
+# package by its own name (issue #6).
+#
+# THIS repo is asked first and wins whenever it offers an asset. The THEME release is a fallback, and
+# it exists because the split is not instantaneous: until this repo has a signing secret and can cut a
+# release, its `latest` is empty, while the theme's transition release still carries a signed updater
+# asset. Same key verifies both, so the fallback changes where the bytes come from and never whether
+# they are checked. DELETE the fallback branch once this repo publishes — it is dead code from that
+# day, and the theme repo stops shipping an updater asset in the release after it.
 info "Resolving the updater release (latest) from $REPO_UPDATER..."
 UPDATER_JSON="$TMP/updater.json"
 UPDATER_URL=""
 if resolve_release "$REPO_UPDATER" "$UPDATER_JSON" latest; then
 	UPDATER_URL=$(asset_urls "$UPDATER_JSON" luci-app-footstrap-updater | head -n1)
-else
-	warn "Could not reach the updater repo — installing the theme only."
+fi
+if [ -z "$UPDATER_URL" ]; then
+	UPDATER_URL=$(asset_urls "$THEME_JSON" luci-app-footstrap-updater | head -n1)
+	if [ -n "$UPDATER_URL" ]; then
+		UPDATER_JSON="$THEME_JSON"
+		info "This repo publishes no asset yet — taking the updater from the theme release."
+	else
+		warn "No updater asset in either repo — installing the theme only."
+	fi
 fi
 
 # --- download, verify, install --------------------------------------------

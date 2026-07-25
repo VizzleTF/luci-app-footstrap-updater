@@ -10,6 +10,12 @@ Deprecated, Removed, Fixed, Security, Performance — one of each per release.
 
 Every commit writes into `[Unreleased]`. Cutting a tag renames that heading.
 
+## [Unreleased]
+
+### Security
+
+- **A high-severity advisory in the dev toolchain is closed (`brace-expansion`).** Nothing shipped was affected — the npm tree exists only for the CI gates, and `luci.mk` copies neither it nor `package.json` — but a lint toolchain should not sit on a known advisory. Transitive, so only the lockfile changed: brace-expansion 5.0.8.
+
 ## [1.1.0] — 2026-07-25
 
 ### Added

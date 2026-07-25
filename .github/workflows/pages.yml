@@ -1,0 +1,86 @@
+# Publishes a MIRROR of the latest release to GitHub Pages — the signed manifest, its signature, the
+# release notes and the packages themselves. Nothing else: this repo has no docs portal (that is the
+# theme's), so the site IS the mirror.
+#
+# WHY. install.sh and footstrap-selfupdate.sh read release metadata from
+# `github.com/<repo>/releases/latest/download/…`, which is not the rate-limited REST API (issue #17).
+# That solves the budget, not reachability: if github.com itself cannot be reached, a release asset
+# cannot be fetched either — the asset URL redirects THROUGH github.com. github.io is a different
+# host, so this is a second place to get the same bytes.
+#
+# IT REQUIRES NO TRUST. The manifest carries its own ed25519 signature and the sha256 of every
+# package; both readers verify before parsing and hash every package they download. A mirror can
+# therefore serve the real release or fail — it cannot serve a different one.
+#
+# One-time setup by a maintainer: repo Settings → Pages → Source = "GitHub Actions".
+name: pages
+
+on:
+  workflow_dispatch:
+  # Called by build.yml's release job once the release is published. It cannot be `on: release`:
+  # an event raised by GITHUB_TOKEN does not trigger another workflow.
+  workflow_call:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mirror the latest release
+        run: |
+          set -eu
+          mkdir -p _site
+          if ! curl -fsSL --retry 2 -o _site/manifest.txt \
+                 "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/manifest.txt"; then
+            echo "the latest release publishes no manifest — nothing to mirror"
+            rm -f _site/manifest.txt
+            echo "<!doctype html><title>footstrap updater mirror</title><p>No release mirrored yet." > _site/index.html
+            exit 0
+          fi
+          curl -fsSL --retry 2 -o _site/manifest.txt.sig \
+            "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/manifest.txt.sig"
+          curl -fsSL --retry 2 -o _site/notes.md \
+            "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/notes.md" || rm -f _site/notes.md
+          # Every package the manifest names, under the name the manifest gives it — the same string a
+          # router will ask this mirror for. Reading the list out of the manifest rather than globbing
+          # the release is what keeps the two in step.
+          tag=$(awk '$1=="tag"{print $2; exit}' _site/manifest.txt)
+          awk '$1=="pkg"{print $4}' _site/manifest.txt | while read -r f; do
+            curl -fsSL --retry 2 -o "_site/$f" \
+              "https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/$f"
+            echo "mirrored: $f ($(wc -c < "_site/$f") bytes)"
+          done
+          # A landing page, so a human who opens the URL is not met with a 404. The file list is taken
+          # BEFORE the redirect creates index.html, which would otherwise list itself.
+          files=$(cd _site && ls)
+          {
+            echo "<!doctype html><meta charset=utf-8><title>footstrap updater release mirror</title>"
+            echo "<h1>luci-app-footstrap-updater — release mirror</h1>"
+            echo "<p>A signed mirror of <a href=\"https://github.com/$GITHUB_REPOSITORY/releases/latest\">$tag</a>,"
+            echo "for routers that cannot reach github.com. Every file here is covered by the signature on"
+            echo "<a href=\"manifest.txt\">manifest.txt</a> and is verified by the installer before use.</p><ul>"
+            for f in $files; do echo "<li><a href=\"$f\">$f</a></li>"; done
+            echo "</ul>"
+          } > _site/index.html
+          echo "mirror of $tag complete."
+
+      - uses: actions/upload-pages-artifact@v3
+        with: { path: _site }
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

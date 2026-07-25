@@ -272,6 +272,50 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # The notes are an ASSET now (dist/notes.md), not just the release body: the confirm dialog
+      # reads them from the release, which used to mean `@.body` and therefore api.github.com.
+      - name: Build release notes from the CHANGELOG
+        run: |
+          set -eu
+          ver="${GITHUB_REF_NAME#v}"
+          sh tools/release-notes.sh "$ver" > "$RUNNER_TEMP/notes.md"
+          mkdir -p dist
+          cp "$RUNNER_TEMP/notes.md" dist/notes.md
+          cat "$RUNNER_TEMP/notes.md"
+
+      # The installer as a release asset. The documented one-liner used to fetch it from
+      # raw.githubusercontent.com, which GitHub rate-limits for unauthenticated callers (changelog
+      # 2025-05-08) — the same budget whose exhaustion is issue #17. Release assets have none.
+      - name: Stage the installer as an asset
+        run: cp install.sh dist/install.sh
+
+      # THE MANIFEST — see the theme repo's build.yml for the full reasoning. Short version: every
+      # value the self-updater used to read out of api.github.com (tag, asset name, size, sha256)
+      # goes into one signed text file served from the release CDN, which has no per-IP request
+      # budget. `repo` is in it and the reader checks it: ONE key signs both repos' manifests, so
+      # without that line the theme's manifest would verify perfectly as this one.
+      - name: Build the release manifest
+        run: |
+          set -euo pipefail
+          cd dist
+          {
+            printf 'footstrap-manifest 1\n'
+            printf 'repo %s\n'     "$GITHUB_REPOSITORY"
+            printf 'tag %s\n'      "$GITHUB_REF_NAME"
+            printf 'version %s\n'  "${GITHUB_REF_NAME#v}"
+            printf 'date %s\n'     "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            printf 'notes %s %s\n' "$(sha256sum notes.md | cut -d' ' -f1)" notes.md
+            for f in *.apk *.ipk; do
+              [ -e "$f" ] || continue
+              name=$(printf '%s' "$f" | sed -E 's/[-_][0-9].*$//')
+              printf 'pkg %s %s %s %s %s\n' \
+                "$name" "${f##*.}" "$f" "$(stat -c%s "$f")" "$(sha256sum "$f" | cut -d' ' -f1)"
+            done
+          } > manifest.txt
+          cat manifest.txt
+          grep -q '^pkg luci-app-footstrap-updater ' manifest.txt || {
+            echo "the manifest names no updater package — refusing to publish it"; exit 1; }
+
       # SIGN. The one step that vouches for the bytes a router installs. Detached usign signature, not
       # apk's own: putting our key in /etc/apk/keys would make footstrap a trust anchor for everything
       # the router installs; opkg cannot verify a standalone .ipk at all. The key is a GitHub Actions
@@ -293,9 +337,19 @@ jobs:
           printf '%s' "$FOOTSTRAP_USIGN_KEY" | base64 -d > "$RUNNER_TEMP/sec.key"
           trap 'shred -u "$RUNNER_TEMP/sec.key" 2>/dev/null || rm -f "$RUNNER_TEMP/sec.key"' EXIT
 
+          # manifest.txt is signed alongside the packages, and its signature is the one that does the
+          # most work: it carries every package's sha256, so a manifest-aware reader needs no
+          # per-package .sig. Those are still published — a self-updater already in the field fetches
+          # them, and a router's installed updater cannot be fixed remotely.
+          #
+          # install.sh is signed because it is executable code handed to root. Nothing can check that
+          # during `curl | sh` — the script IS the first thing to arrive — so it is not a link in the
+          # install chain; it lets a careful admin verify the installer out of band.
           pub=luci-app-footstrap-updater/root/usr/share/luci-app-footstrap-updater/release.pub
           n=0
-          for p in $(find dist -maxdepth 1 -type f \( -name '*.apk' -o -name '*.ipk' \) | sort); do
+          for p in $(find dist -maxdepth 1 -type f \
+                       \( -name '*.apk' -o -name '*.ipk' -o -name 'manifest.txt' -o -name 'install.sh' \) \
+                     | sort); do
             "$U" -S -m "$p" -s "$RUNNER_TEMP/sec.key" -x "$p.sig"
             "$U" -V -q -m "$p" -x "$p.sig" -p "$pub" || {
               echo "signature does not verify against $pub — the secret and the shipped key disagree"
@@ -304,8 +358,11 @@ jobs:
             echo "signed + verified: $(basename "$p")"
             n=$((n + 1))
           done
-          # 2 packages: the updater in each of apk and ipk. One key signs them.
-          [ "$n" -ge 2 ] || { echo "expected both packages to sign, signed $n"; exit 1; }
+          # 4: the updater in each of apk and ipk, plus manifest.txt and install.sh. One key signs them.
+          [ "$n" -ge 4 ] || { echo "expected 4 files to sign (2 packages + manifest + installer), signed $n"; exit 1; }
+          # Named, not merely counted: a release whose manifest is unsigned is one every
+          # manifest-aware router REFUSES, and the refusal reads exactly like an attack.
+          [ -s dist/manifest.txt.sig ] || { echo "manifest.txt.sig was not produced"; exit 1; }
 
           # Re-check the name-anchored one-asset invariant on the FINAL set (a .sig ends in .EXT.sig, so
           # it never matches `…\.EXT$`). A fielded self-updater picks the updater by this regex + head -1.
@@ -316,16 +373,50 @@ jobs:
           done
           ls -l dist
 
-      - name: Build release notes from the CHANGELOG
-        run: |
-          ver="${GITHUB_REF_NAME#v}"
-          sh tools/release-notes.sh "$ver" > "$RUNNER_TEMP/notes.md"
-          cat "$RUNNER_TEMP/notes.md"
-
       # Pinned by COMMIT, not the v3 tag: the only third-party action, in the only job holding
       # contents: write. It never sees the signing secret (step-scoped env). (= tag v3.)
-      - name: Attach to release
+      #
+      # PUBLISHED AS A DRAFT, then flipped below. `latest` moves to a release the moment it is
+      # published, and this action creates the release FIRST and uploads assets after — so a router
+      # polling in that window resolves `releases/latest/download/manifest.txt` against a release
+      # that has no manifest yet, and reports a hard error. A draft is not `latest`.
+      - name: Attach to release (draft)
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228
         with:
           files: dist/*
           body_path: ${{ runner.temp }}/notes.md
+          draft: true
+
+      # The one instant at which `latest` moves — everything a router fetches is already uploaded.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release edit "$GITHUB_REF_NAME" --draft=false --repo "$GITHUB_REPOSITORY"
+          # Prove the manifest resolves from the URL a router actually uses. A 404 here means every
+          # update check would have failed, and this is the last moment it is still a red build.
+          for i in 1 2 3 4 5; do
+            if curl -fsSL --retry 2 -o "$RUNNER_TEMP/mf.check" \
+                 "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/manifest.txt"; then
+              break
+            fi
+            [ "$i" = 5 ] && { echo "releases/latest/download/manifest.txt does not resolve"; exit 1; }
+            sleep 5
+          done
+          diff -u dist/manifest.txt "$RUNNER_TEMP/mf.check" || {
+            echo "the manifest served by latest/download is not the one we just built"; exit 1; }
+          echo "manifest.txt resolves through releases/latest/download and matches."
+
+  # Refresh the Pages mirror of the release (manifest + signature + notes + the packages) now that
+  # the release is published. Called, not triggered: `on: release` never fires for a release created
+  # with GITHUB_TOKEN.
+  pages:
+    name: Refresh the Pages mirror
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/pages.yml
+    permissions:
+      contents: read
+      pages: write
+      id-token: write

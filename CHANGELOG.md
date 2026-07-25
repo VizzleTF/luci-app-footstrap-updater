@@ -10,6 +10,34 @@ Deprecated, Removed, Fixed, Security, Performance — one of each per release.
 
 Every commit writes into `[Unreleased]`. Cutting a tag renames that heading.
 
+## [Unreleased]
+
+### Added
+
+- **An optional `GITHUB_PROXY`, read from UCI.** For networks where GitHub is unreachable at all. `uci set footstrap.settings.github_proxy=https://your-proxy/` prefixes github URLs, tried first with the direct route as fallback. Never read from the environment — rpcd hands this backend the caller's environment, so an env-sourced proxy would let anyone holding the update ACL point a root download at a host of their choosing; `GITHUB_PROXY` joins `http_proxy` in the unset list. Safe because the manifest is signed and every package is hashed against it.
+
+- **A signed release manifest replaces `api.github.com` everywhere in this package.** `check`, `check-updater`, `notes`, the free-space preflight and the install itself all read `manifest.txt` + `manifest.txt.sig` from `releases/latest/download/` — the release CDN, which has no request budget. The REST API allows **60 unauthenticated requests per hour per source IP**, and this backend asked on every `check`, i.e. behind the update badge on page loads: behind CGNAT or a shared exit the budget was gone before the admin clicked anything, and every path died with `ERR: cannot reach the GitHub release API` (theme issue #17). Measured: the API answers `x-ratelimit-limit: 60`, `releases/latest/download/…` answers a 302 with no `x-ratelimit-*` header at all.
+
+- **A release mirror on GitHub Pages, carrying the manifest and the packages.** A second host for a router that cannot reach `github.com` at all — and it has to carry the packages too, because a release asset URL redirects *through* `github.com`. It requires no trust: the manifest is signed, the packages are hashed against it, so the mirror can serve the real release or fail. Which host a manifest came from is recorded beside it on disk, because `check` caches the manifest and a later `notes` reads it back in another process; held in a variable, the origin was lost across that boundary and a mirrored router silently went back to `github.com` for the notes and the package.
+
+### Changed
+
+- **One signature check now covers the package, instead of two checks that answered different attackers.** The sha256 came from `@.assets[*].digest`, which GitHub computes from the uploaded bytes — replace an asset and the digest is recomputed for you — so an ed25519 signature over each package sat beside it. The hash now lives in the signed manifest, so verifying the manifest once covers every package it lists and the per-package `.sig` is not fetched. One request less per install, and a strictly stronger check.
+
+- **The confirm dialog's release notes and the free-space preflight are signed data now.** The notes were `@.body` — text nothing had ever verified — and the preflight sized a root install against an unsigned `@.assets[*].size`. The notes are a `notes.md` asset whose sha256 the manifest carries (a mismatch simply shows no notes, which is right for a cosmetic string), and the sizes come out of the manifest.
+
+- **The cache TTL is no longer a rate-limit budget.** 300 s stays, but for the CDN's sake rather than to ration 60 calls an hour.
+
+### Removed
+
+- **The fallback that picked this package out of the THEME's release, and the `asset_ver()` that supported it.** It existed for exactly one situation — this repo had no release yet — which ended when v1.0.0 shipped. Keeping it meant keeping a path nothing exercises, alongside a helper that existed only to read a version out of a file name because a theme release's tag is the theme's version.
+
+### Fixed
+
+- **A replayed manifest can no longer downgrade the theme.** A signed manifest is valid for ever, so an old one from a stale mirror or a cache would have installed an older theme over a newer one with every check passing. Strictly-older is now refused; equal still installs, because that is the Update button's deliberate reinstall.
+
+- **A manifest naming a different repository is refused.** One key signs both repos' manifests, so without that check the theme's manifest would verify perfectly as this package's.
+
 ## [1.0.0] — 2026-07-22
 
 ### Added

@@ -30,17 +30,48 @@ theme does not republish the updater, and vice versa.
 One-liner (auto-detects apk/ipk, installs the theme AND this updater):
 
 ```sh
-wget -qO- https://raw.githubusercontent.com/VizzleTF/luci-app-footstrap-updater/main/install.sh | sh
+wget -qO- https://github.com/VizzleTF/luci-app-footstrap-updater/releases/latest/download/install.sh | sh
 ```
+
+The URL is the **release asset**, not `raw.githubusercontent.com`: GitHub rate-limits raw for
+unauthenticated callers (60 requests per hour per source IP), and behind CGNAT that budget is often
+already spent by somebody else. Release assets carry no such budget. Neither the installer nor the
+update check touches `api.github.com` any more — both read a **signed manifest** published with each
+release (theme issue #17).
+
+If the router cannot reach `github.com` at all, both legs can go through a GitHub proxy. The
+installer takes it from the environment; **the update backend takes it from UCI and never from the
+environment** — rpcd hands that process the caller's environment, so an env-sourced proxy would let
+anyone holding the update ACL redirect a root download:
+
+```sh
+# one-off install through a proxy
+GITHUB_PROXY=https://gh-proxy.com/ sh install.sh
+# make the Update button use one, permanently
+uci set footstrap.settings.github_proxy=https://gh-proxy.com/ && uci commit footstrap
+```
+
+Public proxies that worked when this was written, none of them ours and any of them able to vanish:
+`https://gh-proxy.com/`, `https://ghproxy.net/`, `https://ghfast.top/`, `https://gh.llkk.cc/`. What
+they deliver is safe regardless: every package is checked against the sha256 in the signed manifest.
 
 ## The trust chain
 
 `install.sh` and `footstrap-selfupdate.sh` hand the downloaded package to apk/opkg with
 `--allow-untrusted` — which means the package manager holds no key of ours, **not** that the bytes are
 unverified. Verifying them is these scripts' own job: a verified-TLS fetch, an **ed25519 signature**
-(`usign`) over each package as the link that actually holds, and the sha256 GitHub publishes below it.
-Everything fails **closed**: a missing digest, a missing `.sig` asset, or no `usign` on the box all
-refuse. See the header comments in both scripts.
+(`usign`) over the release **manifest**, and every package's sha256 carried inside that manifest.
+
+One signature therefore covers every package the release lists. That is why the hash is no longer
+taken from `@.assets[*].digest`: GitHub *computes* that from the uploaded bytes, so anyone who could
+replace an asset — a leaked write-scoped PAT, no CI run involved — had the digest recomputed for them
+and the check verified the attacker's package. A manifest cannot be re-signed that way; the key is a
+secret that cannot be read back out.
+
+Everything fails **closed**: a manifest that will not verify, one naming a different repository, a
+missing or malformed hash, a checksum mismatch, or no `usign` on the box all refuse. It is also what
+makes a proxy or a mirror safe to use — neither can influence a hash that is under the signature. See
+the header comments in both scripts.
 
 ## Development
 

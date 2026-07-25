@@ -4,9 +4,11 @@
 # Downloads the latest GitHub release packages for the Footstrap theme and installs them with apk
 # (25.12+) or opkg (24.10). It installs BOTH the theme (luci-theme-footstrap) and this updater
 # (luci-app-footstrap-updater), which since the split ship from their OWN GitHub repos with their own
-# tags — so do_update hits two release APIs and skips the updater leg when it is already current. The
-# repos and API endpoints are hard-coded and only fixed keywords are accepted, so the ACL-gated LuCI
-# `file.exec` that triggers it has no injection surface.
+# tags — so do_update reads two release manifests and skips the updater leg when it is already
+# current. The repos and URLs are hard-coded and only fixed keywords are accepted, so the ACL-gated
+# LuCI `file.exec` that triggers it has no injection surface.
+#
+# IT NO LONGER TOUCHES api.github.com — that is issue #17, and the reason is in the MF_* block below.
 #
 # But note WHAT the ACL gates: file.exec matches the command PATH only — `params` and `env` are the
 # caller's. So the keyword is not limited to the two the client sends (`__run` is the privileged
@@ -34,7 +36,7 @@
 # go too: they would redirect the fetch through a host of the caller's choosing.
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
-unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT IFS http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
+unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT IFS http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY GITHUB_PROXY
 
 # State in /var/run (a symlink to /tmp/run), NOT in /tmp. /tmp is 1777: a local unprivileged process
 # can pre-create a predictable name there as a symlink, and root's `cp`, `chmod`, `-o` and `>` then
@@ -45,37 +47,75 @@ STATUS="$WD/status"
 WORKER="$WD/run.sh"
 CACHE="$WD/latest"		# the "ts tag" meta line (THEME latest)
 UCACHE="$WD/updater-latest"	# the "ts tag" meta line (UPDATER latest), for `check-updater`
-APIJSON="$WD/api.json"		# the full THEME releases/latest answer; feeds both `check` (tag) and `notes` (body)
+THEME_MF="$WD/theme.mf"		# the VERIFIED theme manifest; feeds `check` (tag), `notes` and do_update
+UPD_MF="$WD/updater.mf"		# the VERIFIED updater manifest
+NOTES="$WD/notes.md"		# the release notes asset, hash-checked against the theme manifest
 LOCK="$WD/lock"		# a DIRECTORY: mkdir is the atomic test-and-set (see the "" branch)
 
 mkdir -p "$WD" 2>/dev/null && chmod 700 "$WD" 2>/dev/null || {
 	echo "ERR: cannot create $WD"; exit 1
 }
 
-# How long a `check` result stays good. GitHub allows 60 unauthenticated API calls per hour per source
-# IP; without a cache every page load spends one. 5 minutes, not an hour: the TTL is exactly how long
-# a freshly published release stays invisible, and an hour let the badge lag a release by most of one.
-# Worst case at 300 s is 12 calls/hour even with the admin reloading — well inside the 60-call budget.
+# How long a `check` result stays good. This used to be sized against GitHub's 60-unauthenticated-
+# API-calls-per-hour-per-IP budget, which the badge could exhaust on a shared exit — issue #17, and
+# the reason the manifest below replaced the API entirely. There is no budget on the release CDN, so
+# the TTL is now only about not re-fetching on every page load. 5 minutes, not an hour: the TTL is
+# exactly how long a freshly published release stays invisible, and an hour let the badge lag a
+# release by most of one.
 CACHE_TTL=300
 
 # TWO repos since the split: the theme and the updater ship from their own GitHub repos, each with its
 # own tags and release stream. `check`/`notes` (the badge + the confirm dialog) are about the THEME —
-# that is what the user updates — so they hit the theme repo. do_update installs BOTH: the theme from
-# its repo, the updater from the updater repo when it offers an asset and from the THEME release when
-# it does not (resolve_updater — read it before touching either leg), each verified against the same
-# key (one release.pub). The updater leg is SKIPPED when the installed version already matches the
-# resolved one ("use the existing one"), so an unchanged updater is neither downloaded nor reinstalled.
+# that is what the user updates — so they read the theme's manifest. do_update installs BOTH, each
+# from its own repo and each verified against the same key (one release.pub). The updater leg is
+# SKIPPED when the installed version already matches the resolved one, so an unchanged updater is
+# neither downloaded nor reinstalled.
 REPO_THEME="VizzleTF/luci-theme-footstrap"
 REPO_UPDATER="VizzleTF/luci-app-footstrap-updater"
-API_THEME="https://api.github.com/repos/${REPO_THEME}/releases/latest"
-API_UPDATER="https://api.github.com/repos/${REPO_UPDATER}/releases/latest"
+PKG_THEME="luci-theme-footstrap"
 PKG_UPDATER="luci-app-footstrap-updater"
 
-# Which package manager this router runs — apk on 25.12+, opkg on 24.10 — and therefore which asset
-# extension asset_urls looks for. Resolved ONCE, at top level, NOT inside do_update: `check-updater`
-# resolves an asset too (its fallback picks the updater out of the theme release, by name AND
-# extension), and an unset $EXT there leaves asset_urls grepping for a name ending in a bare dot, which
-# matches nothing — a silent "no update available" on every router.
+# NO api.github.com ANYWHERE IN THIS FILE, and that is the point of the manifest.
+#
+# The API allows 60 unauthenticated requests per hour PER SOURCE IP. This script asks on every
+# `check` — i.e. behind the badge, on page loads — so behind CGNAT, a shared exit or a DNS-based
+# unblocker the budget is gone before the admin ever clicks anything, and every update path died
+# with "cannot reach the GitHub release API" (issue #17). The release CDN has no such budget:
+# `releases/latest/download/<file>` answers a 302 with no x-ratelimit-* header at all, and it has
+# been serving the packages themselves all along.
+#
+# So the metadata moved into manifest.txt — a signed, line-oriented file published as a release
+# asset, carrying the tag, and every package's name, size and sha256. See resolve_manifest.
+MF_THEME="https://github.com/${REPO_THEME}/releases/latest/download/manifest.txt"
+MF_UPDATER="https://github.com/${REPO_UPDATER}/releases/latest/download/manifest.txt"
+# The mirror on GitHub Pages — a different host, carrying the same signed manifest AND the packages
+# it names, for when github.com itself cannot be reached. Requires no trust: the manifest's
+# signature and the hashes under it are checked identically whichever host served the bytes.
+MIRROR_THEME="https://vizzletf.github.io/luci-theme-footstrap"
+MIRROR_UPDATER="https://vizzletf.github.io/luci-app-footstrap-updater"
+
+# An OPTIONAL prefix put in front of every github.com URL, for networks where GitHub is unreachable.
+# Empty unless the admin sets it:  uci set footstrap.settings.github_proxy=https://example/ ; uci commit
+#
+# READ FROM UCI, NEVER FROM THE ENVIRONMENT, and that is the whole design of it. rpcd hands this
+# process the CALLER's environment — which is why PATH and the loader variables are pinned above and
+# http_proxy is unset — so an env-sourced proxy would let anyone holding this ACL point a root
+# download at a host of their choosing. UCI is writable by root alone, so the setting is the
+# admin's, not the caller's. GITHUB_PROXY is unset with the rest for the same reason.
+#
+# Safe to offer because the manifest is signed and every package is hashed against it: a proxy can
+# serve the real release or fail, and nothing in between. Unlike install.sh there is no unsigned
+# script in the path here — this file is already on disk, installed from a verified package.
+GITHUB_PROXY="$(uci -q get footstrap.settings.github_proxy 2>/dev/null)"
+case "$GITHUB_PROXY" in
+	https://*) ;;
+	*) GITHUB_PROXY="" ;;	# anything not https is ignored, silently and safely
+esac
+
+# Which package manager this router runs — apk on 25.12+, opkg on 24.10 — and therefore which `pkg`
+# line of the manifest applies. Resolved ONCE, at top level, NOT inside do_update: `check-updater`
+# reads a manifest too, and an unset $EXT there makes mf_pkg match no line at all — a silent "no
+# update available" on every router.
 if command -v apk >/dev/null 2>&1; then EXT="apk"
 elif command -v opkg >/dev/null 2>&1; then EXT="ipk"
 else EXT=""
@@ -117,7 +157,7 @@ PUBKEY=/usr/share/luci-app-footstrap-updater/release.pub
 # manager installs --allow-untrusted regardless (it holds no key of ours) — but do not read this
 # channel as more than "a verified-certificate delivery of the release metadata".
 # @mirror gh/fetch
-fetch() {
+fetch_direct() {
 	_u="$1"; _t="$2"; _o="$3"
 	if command -v uclient-fetch >/dev/null 2>&1; then
 		if [ -n "$_o" ]; then uclient-fetch -T "$_t" -qO "$_o" "$_u" 2>/dev/null
@@ -141,15 +181,45 @@ fetch() {
 	fi
 	return 1
 }
+# fetch <url> <max-seconds> [outfile] — the one every caller uses. With no GITHUB_PROXY set (the
+# default) it IS fetch_direct; with one set, GitHub URLs are tried through the proxy first and fall
+# back to the direct route, so a dead proxy cannot take the install down with it.
+#
+# Only github hosts are rewritten. A proxy prefix has no business in front of, say, the Pages mirror
+# URL, and an unconditional rewrite would send every future URL through a third party by accident.
+#
+# The proxy can serve wrong bytes; it cannot serve bytes that pass. Everything fetched through here
+# is either checked against the signed manifest (packages, notes) or IS the signature check itself
+# (the manifest and its .sig). The one thing outside that chain is this script, which is why the
+# documented install URL never goes through a proxy — see the GITHUB_PROXY note at the top.
+fetch() {
+	_fu="$1"; _ft="$2"; _fo="$3"
+	if [ -n "$GITHUB_PROXY" ]; then
+		case "$_fu" in
+			https://github.com/*|https://api.github.com/*|https://raw.githubusercontent.com/*|https://objects.githubusercontent.com/*|https://release-assets.githubusercontent.com/*)
+				if fetch_direct "${GITHUB_PROXY%/}/$_fu" "$_ft" "$_fo"; then
+					[ -z "$_fo" ] || [ -s "$_fo" ] && return 0
+				fi
+				[ -n "$_fo" ] && rm -f "$_fo"
+				;;
+		esac
+	fi
+	fetch_direct "$_fu" "$_ft" "$_fo"
+}
 # @endmirror
 
 # The URL comes out of the API answer and the file it names is handed to `apk add --allow-untrusted`
 # as root. Pin the host, so a malformed or tampered response cannot point that install at an arbitrary
 # server.
 # @mirror gh/asset-host
+# vizzletf.github.io is the release MIRROR (see resolve_manifest). It is on the list because a
+# mirrored install fetches its packages from there — not because being on the list is what makes
+# those bytes acceptable: what does that is the sha256 in the signed manifest, which the mirror
+# cannot influence.
 asset_host_ok() {
 	case "$1" in
 		https://github.com/*|https://objects.githubusercontent.com/*|https://release-assets.githubusercontent.com/*) return 0 ;;
+		https://vizzletf.github.io/*) return 0 ;;
 	esac
 	return 1
 }
@@ -165,21 +235,24 @@ asset_host_ok() {
 # `name-1.2.3-r1.apk`, ipk: `name_1.2.3-r1_all.ipk`); anchoring on `/` in front stops a repo or tag
 # containing the package name from matching.
 #
-# @mirror gh/asset-urls
-asset_urls() {		# <json> <package-name> -> every matching asset URL, one per line
-	jsonfilter -i "$1" -e '@.assets[*].browser_download_url' 2>/dev/null \
-		| grep -E "/$2[-_][^/]*\.$EXT\$" || true
+# The manifest reader. `pkg` lines are `pkg <name> <ext> <file> <size> <sha256>`; everything else is
+# `<key> <value>`. Line-oriented on purpose — awk is in busybox, so this path needs no jsonfilter at
+# all, one fewer thing between a router and an update.
+# @mirror gh/manifest-parse
+mf_get() { awk -v k="$2" '$1==k {print $2; exit}' "$1"; }
+mf_pkg() {		# <manifest> <package-name> <ext> -> "<file> <size> <sha256>"
+	awk -v n="$2" -v e="$3" '$1=="pkg" && $2==n && $3==e {print $4, $5, $6; exit}' "$1"
 }
-asset_digest() {	# <json> <url> -> the sha256 GitHub publishes for THAT asset
-	# matched on the URL rather than on list position — the two `assets[*]` lists
-	# happen to be parallel today, but nothing promises it
-	jsonfilter -i "$1" -e "@.assets[@.browser_download_url=\"$2\"].digest" 2>/dev/null | head -n1
-}
-sig_url() {		# <json> <package-url> -> the detached signature published for THAT package
-	# Looked UP in the asset list, never derived by appending ".sig" to the URL: a derived URL
-	# is a URL nobody published, and it would send the fetch after a file the release does not
-	# claim to have. -Fx = whole line, literal.
-	jsonfilter -i "$1" -e '@.assets[*].browser_download_url' 2>/dev/null | grep -Fx "$2.sig" || true
+
+# The manifest names the asset FILE, and that name becomes both a URL and a path in the working
+# directory. The signature is what makes the name trustworthy — but a compromised pipeline signing
+# `../../etc/something` must still not become a path traversal as root, and a defence that only
+# works when the other defence held is not a defence.
+safe_name() {
+	case "$1" in
+		''|*/*|.*|*[!A-Za-z0-9._-]*) return 1 ;;
+	esac
+	return 0
 }
 # @endmirror
 
@@ -188,6 +261,72 @@ sig_url() {		# <json> <package-url> -> the detached signature published for THAT
 # `Version: 1.2.3-r1`. The updater tag drives PKG_VERSION (`1.2.3`), so strip the `-rN`/`-N` release
 # suffix from both before comparing. Used only to decide whether the updater leg can be SKIPPED.
 ver_base() { echo "${1%-*}"; }		# 1.2.3-r1 -> 1.2.3 ; 1.2.3 -> 1.2.3 (no dash: unchanged)
+
+# Is $1 strictly older than $2? Field-by-field numeric compare, so 0.10.0 > 0.9.9 (a string compare
+# gets that backwards, and this project has already shipped a 0.9 -> 0.10 boundary). A non-numeric
+# field compares as 0 and the answer degrades to "not older", which is the safe direction: it
+# permits the install rather than blocking a legitimate one.
+ver_lt() {		# 0 iff $1 is strictly older than $2
+	_vi=1
+	while [ "$_vi" -le 3 ]; do
+		_vx=$(echo "$1" | cut -d. -f"$_vi"); _vy=$(echo "$2" | cut -d. -f"$_vi")
+		case "$_vx" in ''|*[!0-9]*) _vx=0 ;; esac
+		case "$_vy" in ''|*[!0-9]*) _vy=0 ;; esac
+		[ "$_vx" -lt "$_vy" ] && return 0
+		[ "$_vx" -gt "$_vy" ] && return 1
+		_vi=$((_vi + 1))
+	done
+	return 1
+}
+
+# Fetch a repo's signed manifest, VERIFY it, and only then let anything read it. Order matters:
+# parsing first would mean acting on unverified text, and every value in there steers a download.
+#
+# RECORDS WHERE THE MANIFEST CAME FROM, in a file beside it (`<manifest>.base`), because that fact
+# outlives this process: `check` caches the manifest and a LATER `notes` reads it back without
+# re-resolving. Held in a variable, the origin was lost across that boundary and every mirrored
+# router silently went back to github.com for the notes and the package — measured: `check` answered
+# from the mirror, `notes` came back empty. A router that could not reach github.com for the manifest
+# will not reach it for a package either (a release asset URL redirects THROUGH github.com), so the
+# mirror has to serve both, and the signed sha256 is what holds in either case.
+#
+# Return codes are distinct because the fixes are: 1 = could not fetch, 2 = signature failed (never
+# overridable), 3 = verified but describes a DIFFERENT repo. That last one is not pedantry: ONE key
+# signs both repos' manifests, so without the `repo` check a manifest lifted from the theme's
+# release verifies perfectly as the updater's. A signature proves who wrote a file, never what the
+# file is about.
+#
+# Every name is `_mf*`: sh has no locals and fetch() assigns `_u`, `_t` and `_o` — writing this with
+# the obvious names cost an afternoon in the theme's installer, where `_o` came back as the .sig
+# path and the tag check silently compared the timeout against "latest".
+resolve_manifest() {	# <repo> <manifest-url> <mirror-base> <outfile> <timeout>
+	_mfrepo="$1"; _mfurl="$2"; _mfmirror="$3"; _mfout="$4"; _mftmo="$5"
+	: > "$_mfout.base"
+
+	if ! { fetch "$_mfurl" "$_mftmo" "$_mfout" && [ -s "$_mfout" ] &&
+	       fetch "$_mfurl.sig" "$_mftmo" "$_mfout.sig" && [ -s "$_mfout.sig" ]; }; then
+		[ -n "$_mfmirror" ] || return 1
+		fetch "$_mfmirror/manifest.txt" "$_mftmo" "$_mfout" && [ -s "$_mfout" ] || return 1
+		fetch "$_mfmirror/manifest.txt.sig" "$_mftmo" "$_mfout.sig" && [ -s "$_mfout.sig" ] || return 1
+		echo "$_mfmirror" > "$_mfout.base"
+	fi
+
+	verify_sig "$_mfout" "$_mfout.sig" "$PUBKEY" || return 2
+	[ "$(mf_get "$_mfout" repo)" = "$_mfrepo" ] || return 3
+	return 0
+}
+
+# The URL to fetch a file the manifest names. Built HERE from the manifest's own tag — never from
+# `latest` — because between reading the manifest and fetching the package a newer release can
+# become latest, and the sha256 about to be enforced belongs to the release we READ.
+mf_asset_url() {	# <manifest> <repo> <file> -> url
+	_mfbase="$(cat "$1.base" 2>/dev/null)"
+	if [ -n "$_mfbase" ]; then
+		echo "$_mfbase/$3"
+	else
+		echo "https://github.com/$2/releases/download/$(mf_get "$1" tag)/$3"
+	fi
+}
 installed_ver() {	# <pkg> -> installed version, or empty (not installed / manager unknown)
 	if command -v apk >/dev/null 2>&1; then
 		apk list -I "$1" 2>/dev/null | sed -n "s/^$1-\([0-9][^ ]*\) .*/\1/p" | head -n1
@@ -196,63 +335,24 @@ installed_ver() {	# <pkg> -> installed version, or empty (not installed / manage
 	fi
 }
 
-# The version an asset carries in its FILE NAME. Needed only on the FALLBACK path below, where the
-# updater asset is picked out of the THEME release: that release's `tag_name` is the THEME's version,
-# so the updater's own version can only come from the file name. Both naming schemes are handled —
-# apk `name-0.9.4-r1.apk`, ipk `name_0.9.4-r1_all.ipk` — and the `-rN` release suffix is stripped, so
-# the result compares against installed_ver() on the same footing as a bare release tag.
-asset_ver() {		# <asset url> -> 0.9.4 (empty if the name does not parse)
-	_n="${1##*/}"
-	_n="${_n#"$PKG_UPDATER"}"; _n="${_n#-}"; _n="${_n#_}"
-	_n="${_n%%_*}"			# ipk: drop the `_all.ipk` arch tail
-	_n="${_n%.apk}"; _n="${_n%.ipk}"
-	case "$_n" in [0-9]*) ver_base "$_n" ;; *) echo "" ;; esac
-}
-
-# WHERE THE UPDATER COMES FROM, and why there are two answers.
+# THE UPDATER COMES FROM ITS OWN REPO, and from nowhere else.
 #
-# Since the split the updater's home is its OWN repo — that is the primary source and the one every
-# future release comes from. But the theme repo published the updater as well up to and including the
-# transition release, and the fallback here is what makes the move survivable in BOTH directions:
+# There used to be a second source here: the updater was picked out of the THEME release when its own
+# repo offered nothing. That fallback existed for exactly one situation — the updater repo had no
+# release yet — and it ended the day that repo published v1.0.0. Keeping it meant keeping a path that
+# nothing ever exercises and that no test covers, alongside asset_ver(), which existed only to read a
+# version out of a file name because a theme release's tag is the theme's version. Both are gone.
 #
-#  - the updater repo has no release yet (that is the state this fallback was written for), so a
-#    router that installed the transition updater would otherwise never see an updater update at all;
-#  - the updater repo is unreachable, renamed or its release is broken — the theme release is a
-#    second, already-fetched place to look, at no extra API call.
-#
-# It is deliberately NOT a preference: the updater repo WINS whenever it offers an asset, whatever the
-# versions say, so the day it publishes is the day every router moves onto it. The version comparison
-# stays with the caller (both callers do it differently: do_update skips an equal version, the client
-# badge wants strictly-newer).
-#
-# Sets U_JSON (the release json that LISTS the asset — its digest and .sig live there, so the caller
-# must verify against THIS json, not against whichever it happened to fetch) and U_VER. Returns 1 when
-# neither source offers an updater package, which every caller treats as "nothing to do", never as an
-# error: an absent updater asset is the normal state of a theme-only release.
-resolve_updater() {	# <theme-release-json|""> <fetch-timeout>
-	U_JSON=""; U_VER=""
-	if fetch "$API_UPDATER" "$2" "$WD/updater.json"; then
-		_t="$(jsonfilter -i "$WD/updater.json" -e '@.tag_name' 2>/dev/null)"
-		if [ -n "$_t" ] && [ -n "$(asset_urls "$WD/updater.json" "$PKG_UPDATER" | head -1)" ]; then
-			U_JSON="$WD/updater.json"; U_VER="$(ver_base "${_t#v}")"
-			return 0
-		fi
-	fi
-	rm -f "$WD/updater.json"
-
-	[ -n "$1" ] && [ -f "$1" ] || return 1
-	_u="$(asset_urls "$1" "$PKG_UPDATER" | head -1)"
-	[ -n "$_u" ] || return 1
-	U_VER="$(asset_ver "$_u")"
+# Sets U_VER and, on success, leaves the VERIFIED updater manifest in $UPD_MF. Returns 1 when the
+# updater repo offers no package for this router's format, which every caller treats as "nothing to
+# do", never as an error.
+resolve_updater() {	# <fetch-timeout>
+	U_VER=""
+	resolve_manifest "$REPO_UPDATER" "$MF_UPDATER" "$MIRROR_UPDATER" "$UPD_MF" "$1" || return 1
+	[ -n "$(mf_pkg "$UPD_MF" "$PKG_UPDATER" "$EXT")" ] || return 1
+	U_VER="$(ver_base "$(mf_get "$UPD_MF" version)")"
 	[ -n "$U_VER" ] || return 1
-	U_JSON="$1"
 	return 0
-}
-
-# NOT @mirror'd: install.sh installs one known release and never sums asset sizes, so this has no
-# twin. Used only by the free-space preflight below.
-asset_size() {		# <json> <url> -> the byte size GitHub publishes for THAT asset (empty if none)
-	jsonfilter -i "$1" -e "@.assets[@.browser_download_url=\"$2\"].size" 2>/dev/null | head -n1
 }
 
 # usign is on EVERY OpenWrt image — base-files depends on it — so verifying the release signature costs
@@ -266,76 +366,50 @@ verify_sig() {		# <file> <sigfile> <pubkey-file> -> 0 iff the signature is ours 
 }
 # @endmirror
 
-# Download ONE asset, verify it, install it.
-# Writes ERR: to $STATUS and returns non-zero on any failure. $1 = url, $2 = release json.
+# Download ONE asset, verify it, install it. $1 = url, $2 = the sha256 out of the SIGNED manifest.
+# Writes ERR: to $STATUS and returns non-zero on any failure.
 #
-# TWO checks, and they answer DIFFERENT attackers:
+# ONE check now, where there used to be two, and it is the stronger of them. The ed25519 signature is
+# still what vouches for the bytes — it is simply checked ONCE, over the manifest, before any of this
+# runs (resolve_manifest), and the hash below is the link from that signature to this package. So the
+# per-package .sig is not fetched: verifying it would re-prove what the manifest already proved.
 #
-#  - the ed25519 SIGNATURE is the real one. The sha256 below cannot stand alone, and the reason is
-#    specific: GitHub COMPUTES `@.assets[*].digest` from the bytes that were uploaded. Anyone who can
-#    replace a release asset — a leaked PAT with write scope, no CI run needed — gets the digest
-#    recomputed for them, and the checksum then verifies the attacker's package happily. The signing
-#    key is not in the repository and cannot be read back out of GitHub, so a replaced asset fails
-#    here.
-#  - the sha256 still earns its place: it catches a tampered or TRUNCATED download from the asset CDN
-#    (objects.githubusercontent.com — a different host from api.github.com) with a clearer failure than
-#    a signature mismatch. It does NOT survive usign's absence — nothing does: a missing usign is rc=2
-#    below and refuses, which is the correct behaviour.
+# It fails CLOSED. A hash that is empty or not hex refuses; a mismatch refuses; a manifest whose
+# signature did not verify never reaches this function at all. The `if [ -n "$digest" ]` shape this
+# once had fails OPEN — a renamed field or an absent tool leaves the variable empty and the install
+# proceeds with no integrity check while reporting OK. Bytes we cannot account for, we do not hand to
+# root.
 #
-# Both fail CLOSED. A missing digest, a missing .sig asset, no usign on the box: all refuse. The `if [
-# -n "$digest" ]` shape this once had fails OPEN — a renamed field, a predicate that stops resolving,
-# an absent tool, all leave the variable empty, and it installed with no integrity check at all while
-# reporting OK. Bytes we cannot account for, we do not hand to root.
+# usign's absence is a refusal too, and it happens EARLIER than it used to: verify_sig returns 2, so
+# resolve_manifest returns 2 and the caller reports it. Nothing downstream can be reached without it.
 fetch_verify_install() {
-	url="$1"; json="$2"
+	url="$1"; want="$2"		# the sha256 from the SIGNED manifest
 	pkg="$WD/pkg.$EXT"
-	sig="$pkg.sig"
 
 	asset_host_ok "$url" || { echo "ERR: asset from an unexpected host" > "$STATUS"; return 1; }
 
 	fetch "$url" 600 "$pkg" || { echo "ERR: download failed" > "$STATUS"; return 1; }
 	[ -s "$pkg" ] || { echo "ERR: empty download" > "$STATUS"; rm -f "$pkg"; return 1; }
 
-	digest="$(asset_digest "$json" "$url")"
-	want="${digest#sha256:}"
+	# The hash came out of a manifest whose ed25519 signature was checked before it was parsed, so
+	# THIS comparison is the signature check, applied to the package. That is why no per-package .sig
+	# is fetched here any more: one usign verification over the manifest covers every hash it lists.
+	# (The .sig assets are still published — a self-updater already in the field fetches them, and a
+	# router's installed updater cannot be fixed remotely.)
+	#
+	# It is strictly stronger than what it replaced. The old check compared against
+	# `@.assets[*].digest`, which GitHub COMPUTES from the uploaded bytes: anyone who could replace
+	# an asset (a leaked write-scoped PAT, no CI run involved) had the digest recomputed for them and
+	# the check then verified the attacker's package. A manifest cannot be re-signed that way — the
+	# key is a secret that cannot be read back out.
 	case "$want" in
 		[0-9a-fA-F][0-9a-fA-F]*) ;;
-		*) echo "ERR: release lists no sha256 for the asset, refusing to install" > "$STATUS"
+		*) echo "ERR: the release manifest lists no sha256 for the asset, refusing to install" > "$STATUS"
 		   rm -f "$pkg"; return 1 ;;
 	esac
 	got="$(sha256sum "$pkg" 2>/dev/null | cut -d' ' -f1)"
 	[ -n "$got" ] && [ "$want" = "$got" ] || {
-		echo "ERR: checksum mismatch, refusing to install" > "$STATUS"
-		rm -f "$pkg"; return 1
-	}
-
-	# Two DIFFERENT faults, reported apart: "the release publishes no signature" points at the release,
-	# "from an unexpected host" is what an attack looks like, and one message for both sent the admin
-	# after the wrong one. Only the FIRST can fire today — sig_url() matches `$url.sig` with grep -Fx,
-	# and $url passed asset_host_ok above, so the host of a found signature is already pinned by
-	# construction. The check stays anyway, and not as decoration: it is what holds the day sig_url()
-	# stops deriving the URL from an already-checked one (taking any asset whose name ends in .sig would
-	# be an ordinary-looking refactor). Both fail closed.
-	surl="$(sig_url "$json" "$url")"
-	[ -n "$surl" ] || {
-		echo "ERR: release publishes no signature for the package, refusing to install" > "$STATUS"
-		rm -f "$pkg"; return 1
-	}
-	asset_host_ok "$surl" || {
-		echo "ERR: package signature offered from an unexpected host, refusing to install" > "$STATUS"
-		rm -f "$pkg"; return 1
-	}
-	fetch "$surl" 60 "$sig" && [ -s "$sig" ] || {
-		echo "ERR: cannot download the package signature" > "$STATUS"
-		rm -f "$pkg" "$sig"; return 1
-	}
-	verify_sig "$pkg" "$sig" "$PUBKEY"; rc=$?
-	rm -f "$sig"
-	[ "$rc" = 0 ] || {
-		case "$rc" in
-			2) echo "ERR: usign is missing, cannot verify the package signature" > "$STATUS" ;;
-			*) echo "ERR: BAD SIGNATURE — the package is not the one we published" > "$STATUS" ;;
-		esac
+		echo "ERR: checksum mismatch against the signed manifest, refusing to install" > "$STATUS"
 		rm -f "$pkg"; return 1
 	}
 
@@ -357,12 +431,13 @@ fetch_verify_install() {
 # correctly-signed update — space is not a security property (contrast the fail-CLOSED trust chain
 # below, where a missing digest or signature refuses). Worst case without this check is the
 # pre-existing behaviour: apk fails and the client shows its error.
-# check_space <json> <url>...  -> 0 = enough (or unknown); 1 = short (writes ERR to $STATUS)
+# The sizes are the manifest's now, and therefore SIGNED. They used to come from
+# `@.assets[*].size` — an unsigned number, which is a strange thing to have been sizing a root
+# install against even for a fail-open check.
+# check_space <size>...  -> 0 = enough (or unknown); 1 = short (writes ERR to $STATUS)
 check_space() {
-	_j="$1"; shift
 	_need=0; _max=0
-	for _u in "$@"; do
-		_s="$(asset_size "$_j" "$_u")"
+	for _s in "$@"; do
 		case "$_s" in ''|*[!0-9]*) return 0 ;; esac	# size unknown -> skip the check (fail open)
 		_need=$((_need + _s))
 		[ "$_s" -gt "$_max" ] && _max="$_s"
@@ -394,44 +469,61 @@ do_update() {
 	esac
 
 	# --- THEME: from the theme repo -------------------------------------------------------------
-	# The theme is the essential package and the one the user updates. Resolved by NAME, never by a bare
-	# `\.$EXT$` glob: a release with more than one same-format asset is a trap for a self-updater that
-	# picks by extension (issue #6). Its absence in the latest release is a broken release, a hard fail.
-	tjson="$WD/theme.json"
-	fetch "$API_THEME" 20 "$tjson" || { echo "ERR: cannot reach the GitHub release API" > "$STATUS"; return 1; }
-	theme_url="$(asset_urls "$tjson" luci-theme-footstrap | head -1)"
-	[ -n "$theme_url" ] || {
-		echo "ERR: no luci-theme-footstrap .${EXT} asset in latest release" > "$STATUS"
-		rm -f "$tjson"; return 1
-	}
-
-	# --- UPDATER: its own repo first, the theme release as fallback, SKIPPED when already current ---
-	# resolve_updater() decides WHERE (see it for why there are two sources); here we decide WHETHER.
-	# Equal versions -> use the existing one, so an unchanged updater is neither downloaded nor
-	# reinstalled. Optional in BOTH directions — nothing to resolve is skipped, and a present-but-failing
-	# install is non-fatal once the theme is in (below). ORDER: theme first, updater second — the updater
-	# package overwrites THIS running script, which is why the worker runs from a staged copy ($WORKER,
-	# see the "" branch).
+	# The theme is the essential package and the one the user updates. Named in the manifest, never
+	# picked by a bare `\.$EXT$` glob: a release with more than one same-format asset is a trap for a
+	# self-updater that picks by extension (issue #6). Its absence is a broken release, a hard fail.
 	#
-	# The version compare is `!=`, not "newer than": the resolved source is authoritative. That is what
-	# lets a router move from the transition updater (built and published by the THEME repo) onto the
-	# updater repo's own stream. The updater repo's first tag is therefore HIGHER than the transition
-	# build's version, and has to be — opkg refuses a downgrade by default ("Not downgrading package …"),
-	# exits 0 and installs nothing, so a lower tag there would strand every 24.10 router on the
-	# transition build while reporting success.
-	updater_url=""
-	if resolve_updater "$tjson" 20; then
-		[ "$U_VER" != "$(ver_base "$(installed_ver "$PKG_UPDATER")")" ] &&
-			updater_url="$(asset_urls "$U_JSON" "$PKG_UPDATER" | head -1)"
+	# The manifest is re-fetched here rather than reused from `check`'s cache: the cache is up to
+	# CACHE_TTL old, and this is the copy whose hashes are about to gate an install as root.
+	resolve_manifest "$REPO_THEME" "$MF_THEME" "$MIRROR_THEME" "$THEME_MF" 20; rc=$?
+	case "$rc" in
+		0) ;;
+		2) echo "ERR: BAD SIGNATURE on the release manifest — refusing to install" > "$STATUS"; return 1 ;;
+		3) echo "ERR: the release manifest is for a different repository — refusing" > "$STATUS"; return 1 ;;
+		*) echo "ERR: cannot fetch the release manifest from github.com" > "$STATUS"; return 1 ;;
+	esac
+	set -- $(mf_pkg "$THEME_MF" "$PKG_THEME" "$EXT")	# file size sha256
+	theme_file="$1"; theme_size="$2"; theme_sha="$3"
+	[ -n "$theme_file" ] && [ -n "$theme_sha" ] || {
+		echo "ERR: no ${PKG_THEME} .${EXT} in the latest release" > "$STATUS"; return 1
+	}
+	safe_name "$theme_file" || {
+		echo "ERR: the manifest names an implausible asset, refusing" > "$STATUS"; return 1
+	}
+	theme_url="$(mf_asset_url "$THEME_MF" "$REPO_THEME" "$theme_file")"
+
+	# A DOWNGRADE IS A REFUSAL. A signed manifest stays valid for ever, so an old one replayed at a
+	# router — by a stale mirror, by a cache, by someone who kept a copy — would otherwise reinstall
+	# an older theme over a newer one, verifying perfectly the whole way. Nothing else in the chain
+	# says no to that: the signature is genuine and the hash matches. Equal versions are allowed
+	# through, because that is a deliberate reinstall from the Update button.
+	if ver_lt "$(mf_get "$THEME_MF" version)" "$(ver_base "$(installed_ver "$PKG_THEME")")"; then
+		echo "ERR: the release offers an OLDER theme than the one installed — refusing" > "$STATUS"
+		return 1
+	fi
+
+	# --- UPDATER: its own repo, SKIPPED when already current -------------------------------------
+	# Optional in BOTH directions — nothing to resolve is skipped, and a present-but-failing install
+	# is non-fatal once the theme is in (below). ORDER: theme first, updater second — the updater
+	# package overwrites THIS running script, which is why the worker runs from a staged copy
+	# ($WORKER, see the "" branch).
+	#
+	# The compare is `!=`, not "newer than": the updater repo is authoritative for its own package.
+	updater_url=""; updater_size=""; updater_sha=""
+	if resolve_updater 20 && [ "$U_VER" != "$(ver_base "$(installed_ver "$PKG_UPDATER")")" ]; then
+		set -- $(mf_pkg "$UPD_MF" "$PKG_UPDATER" "$EXT")
+		if [ -n "$1" ] && [ -n "$3" ] && safe_name "$1"; then
+			updater_size="$2"; updater_sha="$3"
+			updater_url="$(mf_asset_url "$UPD_MF" "$REPO_UPDATER" "$1")"
+		fi
 	fi
 
 	# Free space, before any download, so a short device fails with a clear cause instead of a
-	# half-written tree. Each asset is measured against the json that LISTS it — which for the updater is
-	# $U_JSON, and that may be $tjson itself on the fallback path.
-	check_space "$tjson" "$theme_url" || { rm -f "$tjson" "$WD/updater.json"; return 1; }
-	[ -n "$updater_url" ] && { check_space "$U_JSON" "$updater_url" || { rm -f "$tjson" "$WD/updater.json"; return 1; }; }
+	# half-written tree. The sizes are the signed ones out of each manifest.
+	check_space "$theme_size" || return 1
+	[ -n "$updater_url" ] && { check_space "$updater_size" || return 1; }
 
-	fetch_verify_install "$theme_url" "$tjson" || { rm -f "$tjson" "$WD/updater.json"; return 1; }
+	fetch_verify_install "$theme_url" "$theme_sha" || return 1
 
 	# The theme (the essential package) is now on disk. A failing updater refresh must NOT strand it
 	# behind stale caches: fetch_verify_install installs NOTHING on a verify failure — the old,
@@ -442,9 +534,8 @@ do_update() {
 	# visibly applied. Re-assert RUNNING so a poll landing between the transient ERR fetch_verify_install
 	# wrote and the OK below never sees it.
 	if [ -n "$updater_url" ]; then
-		fetch_verify_install "$updater_url" "$U_JSON" || echo "RUNNING" > "$STATUS"
+		fetch_verify_install "$updater_url" "$updater_sha" || echo "RUNNING" > "$STATUS"
 	fi
-	rm -f "$tjson" "$WD/updater.json"
 
 	# drop the LuCI menu/dispatch + module caches so the new theme is served at once
 	rm -f /tmp/luci-indexcache* 2>/dev/null
@@ -456,11 +547,11 @@ do_update() {
 case "$1" in
 check)
 	# The router asks GitHub, not the browser: a LAN client often has no route to the internet, and a
-	# browser fetch is subject to CORS and to the user's own rate limit. Cached in /var/run (root-owned
-	# tmpfs — see the CWE-377 note above), so a reboot re-checks. The full API answer is saved to
-	# $APIJSON so `notes` can read the release body from the SAME fetch — one API call feeds both.
+	# browser fetch is subject to CORS. Cached in /var/run (root-owned tmpfs — see the CWE-377 note
+	# above), so a reboot re-checks. The VERIFIED manifest is kept beside the cache so `notes` can use
+	# the same fetch — one request feeds both.
 	now=$(date +%s)
-	if [ -f "$CACHE" ] && [ -f "$APIJSON" ]; then
+	if [ -f "$CACHE" ] && [ -f "$THEME_MF" ]; then
 		read -r ts tag < "$CACHE"
 		# A truncated cache (full tmpfs) leaves ts empty or non-numeric, and an arithmetic error is
 		# FATAL in ash: the script would die here and `check` would answer with an empty string instead
@@ -471,23 +562,38 @@ check)
 		fi
 	fi
 
-	fetch "$API_THEME" 10 "$APIJSON" || { echo "ERR: cannot reach the GitHub release API"; exit 1; }
-	tag="$(jsonfilter -i "$APIJSON" -e '@.tag_name' 2>/dev/null)"
-	[ -n "$tag" ] || { echo "ERR: cannot reach the GitHub release API"; exit 1; }
+	resolve_manifest "$REPO_THEME" "$MF_THEME" "$MIRROR_THEME" "$THEME_MF" 10; rc=$?
+	case "$rc" in
+		0) ;;
+		2) echo "ERR: BAD SIGNATURE on the release manifest"; exit 1 ;;
+		3) echo "ERR: the release manifest is for a different repository"; exit 1 ;;
+		*) echo "ERR: cannot fetch the release manifest from github.com"; exit 1 ;;
+	esac
+	tag="$(mf_get "$THEME_MF" tag)"
+	[ -n "$tag" ] || { echo "ERR: the release manifest names no tag"; exit 1; }
 	echo "$now $tag" > "$CACHE"
 	echo "$tag"
 	exit 0
 	;;
 notes)
-	# The GitHub release body, for the confirm dialog (versions + notes + breaking-change banner). It
-	# rides the cached $APIJSON that `check` already saved — no extra API call in the common path,
-	# where the badge (a `check`) has just been shown. Only if the cache is absent does it fetch once.
+	# The release notes, for the confirm dialog (versions + notes + breaking-change banner). They are
+	# a release ASSET now, not `@.body` — that field was the last thing keeping api.github.com in this
+	# file — and the manifest carries their sha256, so what the dialog shows is covered by the same
+	# signature as everything else. It used to be text nobody had ever checked.
 	#
 	# The OUTPUT IS THE PAYLOAD, not a keyword: the client reads the whole stdout as untrusted display
-	# text and renders it as a text node (never markup) — it is shown BEFORE the signature is verified.
-	# Best-effort: any failure yields an empty body, and the dialog simply omits the notes.
-	[ -f "$APIJSON" ] || fetch "$API_THEME" 10 "$APIJSON" >/dev/null 2>&1
-	[ -f "$APIJSON" ] && jsonfilter -i "$APIJSON" -e '@.body' 2>/dev/null
+	# text and renders it as a text node (never markup). Best-effort: any failure yields an empty body
+	# and the dialog simply omits the notes — including a hash mismatch, which is the right call for a
+	# cosmetic string when the package it describes is verified separately and later.
+	[ -f "$THEME_MF" ] || resolve_manifest "$REPO_THEME" "$MF_THEME" "$MIRROR_THEME" "$THEME_MF" 10 >/dev/null 2>&1
+	[ -f "$THEME_MF" ] || exit 0
+	set -- $(awk '$1=="notes"{print $2, $3; exit}' "$THEME_MF")	# sha256 file
+	[ -n "$1" ] && [ -n "$2" ] && safe_name "$2" || exit 0
+	if [ ! -f "$NOTES" ] || [ "$(sha256sum "$NOTES" 2>/dev/null | cut -d' ' -f1)" != "$1" ]; then
+		fetch "$(mf_asset_url "$THEME_MF" "$REPO_THEME" "$2")" 10 "$NOTES" >/dev/null 2>&1 || exit 0
+		[ "$(sha256sum "$NOTES" 2>/dev/null | cut -d' ' -f1)" = "$1" ] || { rm -f "$NOTES"; exit 0; }
+	fi
+	cat "$NOTES"
 	exit 0
 	;;
 check-updater)
@@ -504,11 +610,8 @@ check-updater)
 	fi
 	# Resolved through the SAME resolver do_update uses, and that is the point: a badge that reads one
 	# source while the install reads another either offers an update that does not happen or hides one
-	# that does. On the fallback path the version comes out of the asset FILE NAME (the theme release's
-	# tag_name is the theme's version, not this package's) — so the theme release json has to be at hand;
-	# $APIJSON is the one `check` already cached, and it is fetched here only if that has not happened.
-	[ -f "$APIJSON" ] || fetch "$API_THEME" 10 "$APIJSON" >/dev/null 2>&1
-	resolve_updater "$APIJSON" 10 || { echo "ERR: cannot reach the GitHub release API"; exit 1; }
+	# that does.
+	resolve_updater 10 || { echo "ERR: cannot fetch the updater manifest from github.com"; exit 1; }
 	tag="v$U_VER"
 	echo "$now $tag" > "$UCACHE"
 	echo "$tag"

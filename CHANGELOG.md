@@ -10,7 +10,7 @@ Deprecated, Removed, Fixed, Security, Performance — one of each per release.
 
 Every commit writes into `[Unreleased]`. Cutting a tag renames that heading.
 
-## [Unreleased]
+## [1.1.0] — 2026-07-25
 
 ### Added
 
@@ -88,4 +88,5 @@ Every commit writes into `[Unreleased]`. Cutting a tag renames that heading.
   updater stays intact to retry, and the run finalises (drops caches, writes `OK`, the client reloads)
   once the theme is in.
 
+[1.1.0]: https://github.com/VizzleTF/luci-app-footstrap-updater/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/VizzleTF/luci-app-footstrap-updater/commits/v1.0.0

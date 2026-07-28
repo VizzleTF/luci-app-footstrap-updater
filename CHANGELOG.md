@@ -12,6 +12,10 @@ Every commit writes into `[Unreleased]`. Cutting a tag renames that heading.
 
 ## [Unreleased]
 
+### Added
+
+- **A router that has the package feed updates through it, and stops pinning itself out of future updates.** `check` reads the version its own package manager already has in its index — no request to github.com, no manifest, nothing to cache — and the Update button then runs `apk add --upgrade` (or `opkg upgrade`) instead of downloading a file. The release path stays exactly where it was, for a router with no repository and for the `curl | sh` install that cannot have one yet. What this fixes is not tidiness: every install this script ever did ran `apk add --allow-untrusted <file>`, and apk records that as a constraint on the package's **content hash** in `/etc/apk/world` — a line that survives sysupgrade and quietly opts the router out of the feed for good. `apk add --upgrade` is the one form that both rewrites that line to the bare name and moves the version; a bare `apk add` clears the pin and installs nothing, and `apk upgrade` on a pinned package succeeds while changing nothing, which is the worst shape a failure can take. Measured on live 25.12 and 24.10 routers: 0.11.5 pinned to a hash, `check` answers `v0.11.6` from the feed, the update lands 0.11.6 and leaves `luci-theme-footstrap` unpinned. The theme and this package are named in one call, so a theme release needing a newer updater cannot arrive without it.
+
 ### Security
 
 - **A high-severity advisory in the dev toolchain is closed (`brace-expansion`).** Nothing shipped was affected — the npm tree exists only for the CI gates, and `luci.mk` copies neither it nor `package.json` — but a lint toolchain should not sit on a known advisory. Transitive, so only the lockfile changed: brace-expansion 5.0.8.

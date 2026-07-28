@@ -335,6 +335,96 @@ installed_ver() {	# <pkg> -> installed version, or empty (not installed / manage
 	fi
 }
 
+# --- the package feed, when the router has one ------------------------------------------------
+#
+# THE FEED IS THE BETTER PATH AND THIS SCRIPT PREFERS IT. A router that has a repository carrying
+# these packages should update the way it updates everything else: the index is signed, the package
+# manager verifies it, and `apk upgrade` is what the rest of the system already does.
+#
+# The release path below is not deleted, because it is what a router with no route to a repository
+# still has, and it is the only path a fresh `curl | sh` install can take. It stays a fallback.
+#
+# Why this matters beyond tidiness: installing a downloaded file means `apk add --allow-untrusted
+# <file>`, and on 25.12 that writes a pin on the package's content hash into /etc/apk/world. The pin
+# survives sysupgrade, and a pinned package never upgrades from a feed again. So a router that has a
+# feed and updates from a file quietly opts out of the feed for good.
+
+# feed_ver <pkg> -> the version a configured repository offers, or empty.
+#
+# Parsed from what each manager actually prints, checked on both branches:
+#   apk  list --available luci-theme-footstrap
+#        -> luci-theme-footstrap-0.11.6-r1 noarch {…} (Apache-2.0 OFL-1.1)
+#   opkg list luci-theme-footstrap
+#        -> luci-theme-footstrap - 0.11.6-r1 - Footstrap Theme
+#
+# A version has to start with a digit. Without that, `apk list --available luci-app-x` also matches
+# `luci-app-x-extras-1.0` and the sed would hand back "extras-1.0" as a version.
+feed_ver() {
+	case "$EXT" in
+	apk)  apk list --available "$1" 2>/dev/null \
+	        | sed -n "s/^$1-\([0-9][^ ]*\) .*/\1/p" | head -n1 ;;
+	ipk)  opkg list "$1" 2>/dev/null \
+	        | awk -v p="$1" '$1==p && $3 ~ /^[0-9]/ {print $3; exit}' | head -n1 ;;
+	esac
+}
+
+# feed_has_newer -> 0 when a repository offers a theme newer than the installed one.
+#
+# The theme is what decides, because it is what the user updates; the updater rides along in the
+# same transaction. Equal versions are not an update — the release path treats an equal version as a
+# deliberate reinstall from the button, but a feed offering what is already installed is simply a
+# router that is up to date.
+feed_has_newer() {
+	_fv="$(feed_ver "$PKG_THEME")"
+	[ -n "$_fv" ] || return 1
+	ver_lt "$(ver_base "$(installed_ver "$PKG_THEME")")" "$(ver_base "$_fv")"
+}
+
+# feed_update — upgrade through the package manager, and never with --allow-untrusted.
+#
+# Both packages in one call so the theme and the updater that drives it move together: a theme
+# release that needs a newer updater must not be able to land without it.
+#
+# The updater is named only when it is installed from a repository too. A router that installed this
+# package from a release asset has it as a user-installed package the feed also carries; asking the
+# manager to upgrade it is still correct, and if the feed does not carry it the manager says so and
+# the theme upgrade is unaffected.
+feed_update() {
+	case "$EXT" in
+	apk)
+		apk update >/dev/null 2>&1
+		# `apk add --upgrade <name>`, and each half of that is load-bearing. Measured on a 25.12
+		# router, not reasoned about:
+		#
+		# Every install this script did before the feed existed ran `apk add --allow-untrusted
+		# <file>`, and apk records that as a constraint on the package's CONTENT HASH:
+		#
+		#     /etc/apk/world:  luci-theme-footstrap><Q1sbSI39w11cL+ER0DD69B7C050O0=
+		#
+		# `apk upgrade` on a pinned package succeeds, changes nothing and reports success — the
+		# worst shape a failure can take. Adding by NAME rewrites that line to the bare name, which
+		# is what frees the router to follow the feed. But a bare `apk add` is then satisfied by
+		# whatever is already installed: the pin went away and the version did not move. Only
+		# --upgrade does both, in one step.
+		if [ -n "$(feed_ver "$PKG_UPDATER")" ]; then
+			apk add --upgrade "$PKG_THEME" "$PKG_UPDATER"
+		else
+			apk add --upgrade "$PKG_THEME"
+		fi
+		;;
+	ipk)
+		# opkg has no equivalent of that pin — it records a package, not a hash — so the ordinary
+		# upgrade is right here. It refuses when there is nothing newer, which is why the caller
+		# checks first.
+		opkg update >/dev/null 2>&1
+		opkg upgrade "$PKG_THEME" || return 1
+		[ -n "$(feed_ver "$PKG_UPDATER")" ] && opkg upgrade "$PKG_UPDATER"
+		return 0
+		;;
+	*) return 1 ;;
+	esac
+}
+
 # THE UPDATER COMES FROM ITS OWN REPO, and from nowhere else.
 #
 # There used to be a second source here: the updater was picked out of the THEME release when its own
@@ -468,6 +558,33 @@ do_update() {
 		*) echo "ERR: no apk or opkg found" > "$STATUS"; return 1 ;;
 	esac
 
+	# THE FEED FIRST. Everything below this block downloads a file and installs it with
+	# --allow-untrusted, which is the right answer for a router that has no repository and the wrong
+	# one for a router that does: on 25.12 it writes a content-hash pin into /etc/apk/world that
+	# survives sysupgrade, and the package then never upgrades from the feed again.
+	#
+	# Nothing here is verified by this script, and that is the point rather than a gap — the index is
+	# signed and the manager checks it, which is a stronger claim than a manifest signature this
+	# script checks itself, because it is the same check every other package on the router gets.
+	if feed_has_newer; then
+		out="$(feed_update 2>&1)"; rc=$?
+		if [ "$rc" = 0 ]; then
+			# The same cache drop the release path ends with: LuCI serves the old chrome until
+			# the dispatch and module caches are gone, whoever installed the package.
+			rm -f /tmp/luci-indexcache* 2>/dev/null
+			rm -rf /tmp/luci-modulecache 2>/dev/null
+			echo "OK" > "$STATUS"
+			return 0
+		fi
+		# A feed that offers the version but cannot install it is a real failure, not something to
+		# paper over by downloading the same package from somewhere else: the two sources would
+		# disagree about what is installed, and the pin the fallback writes would outlive the
+		# disagreement. One line, like every other status — the client reads exactly one.
+		reason="$(printf '%s' "$out" | tr '\n\t' '  ' | tail -c 200)"
+		echo "ERR: feed upgrade failed: ${reason}" > "$STATUS"
+		return 1
+	fi
+
 	# --- THEME: from the theme repo -------------------------------------------------------------
 	# The theme is the essential package and the one the user updates. Named in the manifest, never
 	# picked by a bare `\.$EXT$` glob: a release with more than one same-format asset is a trap for a
@@ -551,6 +668,21 @@ check)
 	# above), so a reboot re-checks. The VERIFIED manifest is kept beside the cache so `notes` can use
 	# the same fetch — one request feeds both.
 	now=$(date +%s)
+
+	# A configured repository answers first, and locally: no network from this script, no manifest,
+	# no cache to go stale — the manager already has an index and already refreshed it on its own
+	# schedule. If it offers something newer, that is the update this router will actually install
+	# (see do_update), so it is the version to report.
+	#
+	# Nothing is cached here on purpose. The expensive part of `check` is a request to github.com;
+	# reading an index that is already on disk is not worth a TTL, and a TTL would only add a window
+	# where the button offers a version the feed no longer has.
+	feed_new="$(feed_ver "$PKG_THEME")"
+	if [ -n "$feed_new" ] && ver_lt "$(ver_base "$(installed_ver "$PKG_THEME")")" "$(ver_base "$feed_new")"; then
+		echo "v$(ver_base "$feed_new")"
+		exit 0
+	fi
+
 	if [ -f "$CACHE" ] && [ -f "$THEME_MF" ]; then
 		read -r ts tag < "$CACHE"
 		# A truncated cache (full tmpfs) leaves ts empty or non-numeric, and an arithmetic error is

@@ -10,7 +10,7 @@
 
 Каждый коммит пишет в `[Unreleased]`. Срез тега переименовывает этот заголовок.
 
-## [Unreleased]
+## [1.2.0] — 2026-07-28
 
 ### Добавлено
 
@@ -98,5 +98,6 @@
   старый апдейтер остаётся цел для повтора, а прогон финализируется (сброс кэшей, `OK`, перезагрузка
   клиента), раз тема встала.
 
+[1.2.0]: https://github.com/VizzleTF/luci-app-footstrap-updater/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/VizzleTF/luci-app-footstrap-updater/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/VizzleTF/luci-app-footstrap-updater/commits/v1.0.0

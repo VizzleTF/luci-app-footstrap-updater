@@ -10,6 +10,12 @@ Deprecated, Removed, Fixed, Security, Performance — one of each per release.
 
 Every commit writes into `[Unreleased]`. Cutting a tag renames that heading.
 
+## [1.2.1] — 2026-07-29
+
+### Changed
+
+- **Every released package carries this repository's own signature, and the release manifest is written by `owfeed release`.** [owfeed-packages](https://github.com/owfeed/owfeed-packages) now refuses a package it cannot attribute: the feed signs its index and not the packages it carries, so a published `.apk` held no evidence of who built it, and "the author is responsible for this package" rested on nothing checkable. `owfeed sign` puts an EC signature inside each package before the manifest is written — signing appends bytes, so the reverse order would describe files that no longer exist — and the public half is pinned in the feed. It changes nothing about installing: apk takes its trust from the signed index either way. The manifest itself now comes from `owfeed release` rather than from a shell loop here, and the usign signatures with it, so this repository and the theme stop carrying two implementations of one format. **The format identifier changes from `footstrap-manifest` to `owfeed-manifest`, and updaters already on routers are unaffected** — both readers parse positionally and never look at the first line, and owfeed's `pkg` line carries the same five tokens in the same order, appending the architecture as a sixth. Checked against a manifest owfeed actually produced, not inferred: file, size and sha256 come back identical, and `tag`, `version` and `notes` resolve as before.
+
 ## [1.2.0] — 2026-07-28
 
 ### Added

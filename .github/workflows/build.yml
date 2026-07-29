@@ -289,40 +289,72 @@ jobs:
       - name: Stage the installer as an asset
         run: cp install.sh dist/install.sh
 
+      # owfeed is verified against the build attestation from its own release workflow before it
+      # runs. It is about to hold the key that signs this release.
+      - uses: owfeed/owfeed/setup@v0.3.2
+        with:
+          version: v0.3.2
+
+      # `owfeed release` walks dist/<arch>/, because an apk's filename carries no architecture —
+      # in a feed the architecture IS the directory. The SDK build leaves both packages flat, so
+      # sort them by the architecture each one declares: apk says noarch, ipk says all, and the
+      # two spellings are not interchangeable (apk rejects `all` as uninstallable, opkg has never
+      # heard of `noarch`).
+      - name: Sort the packages by the architecture they declare
+        run: |
+          set -euo pipefail
+          mkdir -p dist/noarch dist/all
+          for f in dist/*.apk; do [ -e "$f" ] && mv "$f" dist/noarch/; done
+          for f in dist/*.ipk; do [ -e "$f" ] && mv "$f" dist/all/; done
+          ls -R dist
+
+      # Sign each package with this repository's own EC key, BEFORE the manifest is written:
+      # `owfeed release` records every package's size and sha256, and signing appends bytes, so
+      # the other order would describe files that no longer exist.
+      #
+      # A different claim from the usign signature below. usign signs the manifest — an inventory
+      # checked once by whoever ingests the release. This goes inside the .apk and reaches the
+      # router, where anyone holding the public half can confirm who built the package without
+      # trusting the feed that served it. owfeed-packages requires it: a package it cannot
+      # attribute is one it refuses to publish.
+      - name: Sign the packages with this repository's key
+        env:
+          OWFEED_AUTHOR_KEY: ${{ secrets.OWFEED_AUTHOR_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "${OWFEED_AUTHOR_KEY:-}" ] || {
+            echo "OWFEED_AUTHOR_KEY is not set. The feed refuses a package signed by nobody,"
+            echo "so this release would not be carried."
+            exit 1
+          }
+          owfeed sign --key env:OWFEED_AUTHOR_KEY dist
+
       # THE MANIFEST — see the theme repo's build.yml for the full reasoning. Short version: every
       # value the self-updater used to read out of api.github.com (tag, asset name, size, sha256)
       # goes into one signed text file served from the release CDN, which has no per-IP request
       # budget. `repo` is in it and the reader checks it: ONE key signs both repos' manifests, so
       # without that line the theme's manifest would verify perfectly as this one.
-      - name: Build the release manifest
-        run: |
-          set -euo pipefail
-          cd dist
-          {
-            printf 'footstrap-manifest 1\n'
-            printf 'repo %s\n'     "$GITHUB_REPOSITORY"
-            printf 'tag %s\n'      "$GITHUB_REF_NAME"
-            printf 'version %s\n'  "${GITHUB_REF_NAME#v}"
-            printf 'date %s\n'     "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            printf 'notes %s %s\n' "$(sha256sum notes.md | cut -d' ' -f1)" notes.md
-            for f in *.apk *.ipk; do
-              [ -e "$f" ] || continue
-              name=$(printf '%s' "$f" | sed -E 's/[-_][0-9].*$//')
-              printf 'pkg %s %s %s %s %s\n' \
-                "$name" "${f##*.}" "$f" "$(stat -c%s "$f")" "$(sha256sum "$f" | cut -d' ' -f1)"
-            done
-          } > manifest.txt
-          cat manifest.txt
-          grep -q '^pkg luci-app-footstrap-updater ' manifest.txt || {
-            echo "the manifest names no updater package — refusing to publish it"; exit 1; }
-
-      # SIGN. The one step that vouches for the bytes a router installs. Detached usign signature, not
-      # apk's own: putting our key in /etc/apk/keys would make footstrap a trust anchor for everything
-      # the router installs; opkg cannot verify a standalone .ipk at all. The key is a GitHub Actions
-      # secret (SAME key as the theme repo, so the one release.pub verifies both), unreadable back out,
-      # so a replaced asset with a recomputed sha256 still fails here. Lives in the RELEASE job — the
-      # build job also runs on pull_request, and a secret must never be reachable from a fork.
-      - name: Sign the packages
+      # THE MANIFEST AND THE SIGNATURES — one `owfeed release`, where this job used to hand-roll
+      # both: a shell loop that formatted manifest.txt, and a second that built usign from source
+      # and signed each file. Same key, same signature, same line-oriented format — the readers
+      # already in the field parse `pkg` positionally and never look at the first line, so the
+      # format identifier changing from footstrap-manifest to owfeed-manifest is invisible to
+      # them, and the seventh token owfeed adds sits past the three they read.
+      #
+      # WHAT THE MANIFEST IS FOR: it takes api.github.com out of the install and update path. Every
+      # value the self-updater used to read from the release API — the tag, each asset's name, size
+      # and sha256 — is one small signed text file on the release CDN, which has no per-IP budget.
+      #
+      # WHY THE SIGNATURE IS NOT REDUNDANT WITH GitHub's sha256: GitHub recomputes its digest from
+      # whatever was uploaded, so a replaced asset gets a matching digest. The signing key is not in
+      # the repository and a secret cannot be read back out, so the same swap fails here.
+      #
+      # `repo` is in the file and readers check it. One usign key signs both repositories'
+      # manifests, so without that line the theme's manifest would verify perfectly as this one.
+      #
+      # It runs in the RELEASE job: the build job also runs on pull_request, and a secret must
+      # never be reachable from a fork.
+      - name: Build and sign the release manifest
         env:
           FOOTSTRAP_USIGN_KEY: ${{ secrets.FOOTSTRAP_USIGN_KEY }}
         run: |
@@ -332,40 +364,57 @@ jobs:
             echo "installer will accept. Refusing to publish."
             exit 1
           }
-          U="$(tools/build-usign.sh "$RUNNER_TEMP/usign")"
-          umask 077
-          printf '%s' "$FOOTSTRAP_USIGN_KEY" | base64 -d > "$RUNNER_TEMP/sec.key"
-          trap 'shred -u "$RUNNER_TEMP/sec.key" 2>/dev/null || rm -f "$RUNNER_TEMP/sec.key"' EXIT
-
-          # manifest.txt is signed alongside the packages, and its signature is the one that does the
-          # most work: it carries every package's sha256, so a manifest-aware reader needs no
-          # per-package .sig. Those are still published — a self-updater already in the field fetches
-          # them, and a router's installed updater cannot be fixed remotely.
+          # The secret is base64 of usign's two-line secret-key file — one canonical form, so
+          # nothing has to guess whether newlines survived a copy-paste. owfeed wants the file
+          # itself. It never touches the disk: a step-scoped env var is not in the process table.
           #
-          # install.sh is signed because it is executable code handed to root. Nothing can check that
-          # during `curl | sh` — the script IS the first thing to arrive — so it is not a link in the
-          # install chain; it lets a careful admin verify the installer out of band.
+          # --sign-also carries the installer, which is not a package and does not belong in the
+          # inventory. It is signed because it is executable code handed to root: nothing can check
+          # that during `curl | sh`, so it is not a link in the install chain — it lets a careful
+          # admin verify the installer out of band.
+          OWFEED_RELEASE_KEY="$(printf '%s' "$FOOTSTRAP_USIGN_KEY" | base64 -d)" \
+            owfeed release --repo "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME" \
+                           --sign-also install.sh
+          cat dist/manifest.txt
+
+      # Flatten, then verify every signature with the key the router will use.
+      #
+      # owfeed leaves the packages in dist/noarch and dist/all; a release asset has no directory at
+      # all, and the manifest names files without paths, which is what a router asks for.
+      #
+      # The verify is not ceremony: a secret rotated in GitHub without the public half being
+      # committed would publish a release every installer rejects, and the rejection reads "BAD
+      # SIGNATURE" — indistinguishable from the attack the signature exists to stop.
+      - name: Verify what is about to be published
+        run: |
+          set -euo pipefail
+          for f in dist/*/*.apk dist/*/*.ipk dist/*/*.sig; do
+            [ -e "$f" ] || continue
+            mv "$f" dist/
+          done
+          rmdir dist/*/ 2>/dev/null || true
+          ls -l dist
+
+          U="$(tools/build-usign.sh "$RUNNER_TEMP/usign")"
           pub=luci-app-footstrap-updater/root/usr/share/luci-app-footstrap-updater/release.pub
           n=0
-          for p in $(find dist -maxdepth 1 -type f \
-                       \( -name '*.apk' -o -name '*.ipk' -o -name 'manifest.txt' -o -name 'install.sh' \) \
-                     | sort); do
-            "$U" -S -m "$p" -s "$RUNNER_TEMP/sec.key" -x "$p.sig"
+          for p in dist/*.apk dist/*.ipk dist/manifest.txt dist/install.sh; do
+            [ -e "$p" ] || continue
+            [ -s "$p.sig" ] || { echo "no signature for $(basename "$p")"; exit 1; }
             "$U" -V -q -m "$p" -x "$p.sig" -p "$pub" || {
               echo "signature does not verify against $pub — the secret and the shipped key disagree"
               exit 1
             }
-            echo "signed + verified: $(basename "$p")"
+            echo "verified: $(basename "$p")"
             n=$((n + 1))
           done
-          # 4: the updater in each of apk and ipk, plus manifest.txt and install.sh. One key signs them.
-          [ "$n" -ge 4 ] || { echo "expected 4 files to sign (2 packages + manifest + installer), signed $n"; exit 1; }
-          # Named, not merely counted: a release whose manifest is unsigned is one every
-          # manifest-aware router REFUSES, and the refusal reads exactly like an attack.
+          # 4: the updater in each of apk and ipk, plus manifest.txt and install.sh.
+          [ "$n" -ge 4 ] || { echo "expected 4 signed files, found $n"; exit 1; }
           [ -s dist/manifest.txt.sig ] || { echo "manifest.txt.sig was not produced"; exit 1; }
 
-          # Re-check the name-anchored one-asset invariant on the FINAL set (a .sig ends in .EXT.sig, so
-          # it never matches `…\.EXT$`). A fielded self-updater picks the updater by this regex + head -1.
+          # Re-check the name-anchored one-asset invariant on the FINAL set (a .sig ends in
+          # .EXT.sig, so it never matches `…\.EXT$`). A fielded self-updater picks the updater by
+          # this regex + head -1.
           for ext in apk ipk; do
             re="^luci-app-footstrap-updater[-_][^/]*\.$ext$"
             n=$(ls dist | grep -cE "$re") || true

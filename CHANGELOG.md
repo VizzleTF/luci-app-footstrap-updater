@@ -10,6 +10,12 @@ Deprecated, Removed, Fixed, Security, Performance — one of each per release.
 
 Every commit writes into `[Unreleased]`. Cutting a tag renames that heading.
 
+## [2.0.0] — 2026-08-01
+
+### Removed
+
+- **This package is retired, and installing this release uninstalls it.** It existed because a theme installed from a downloaded file is one the package manager knows no origin for and will never upgrade — so something had to check GitHub and fetch the next version. The theme's installer adds the owfeed-packages feed now, so `apk upgrade` does that job, for every package on the router, against an index signature the feed already carries. The final release hands the theme over and gets out of the way: `postinst` detaches `footstrap-updater-retire.sh`, which waits for the package database lock, adds the feed if it is missing (key, repository, and a `keep.d` entry so a firmware upgrade does not undo it), re-installs the theme *from* the feed — on apk that also clears the content-hash pin `apk add ./file.apk` leaves in `/etc/apk/world`, which is the reason a file-installed theme never upgrades — and only then removes this package. Detached and delayed because a package cannot uninstall itself inside its own install transaction: the manager holds the lock, and `apk del` there would block or corrupt it. Every step fails soft and the removal is gated on the theme actually being installed, so the worst outcome allowed is a router that still has the updater. `logread -e footstrap-retire` shows what happened.
+
 ## [1.2.1] — 2026-07-29
 
 ### Changed
@@ -104,6 +110,7 @@ Every commit writes into `[Unreleased]`. Cutting a tag renames that heading.
   updater stays intact to retry, and the run finalises (drops caches, writes `OK`, the client reloads)
   once the theme is in.
 
+[2.0.0]: https://github.com/VizzleTF/luci-app-footstrap-updater/compare/v1.2.1...v2.0.0
 [1.2.1]: https://github.com/VizzleTF/luci-app-footstrap-updater/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/VizzleTF/luci-app-footstrap-updater/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/VizzleTF/luci-app-footstrap-updater/compare/v1.0.0...v1.1.0

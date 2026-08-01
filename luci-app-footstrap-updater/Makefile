@@ -23,7 +23,7 @@ PKG_VERSION:=$(FOOTSTRAP_VERSION)
 PKG_RELEASE:=1
 endif
 
-LUCI_TITLE:=Footstrap theme self-update
+LUCI_TITLE:=Footstrap theme self-update (RETIRED — installs the theme from the feed and removes itself)
 # +luci-theme-footstrap: this package updates the theme, its fs-update.js requires the theme's
 # fs-version/fs-prefs/fs-router modules, and installing it without the theme is meaningless. +luci-base
 # is transitive through the theme but stated for clarity. NO curl dep — the backend falls back to
@@ -44,11 +44,25 @@ PKG_LICENSE:=Apache-2.0
 # including the admin who just clicked Update. `reload` sends SIGHUP, which re-reads
 # /usr/share/rpcd/acl.d/*, and that ACL refresh (the file.exec grant for the self-update script) is
 # the only thing this package needs from rpcd. See the theme Makefile for the live-verified rationale.
+# THIS PACKAGE IS RETIRED, and installing it now UNINSTALLS it. The theme's installer adds the
+# owfeed-packages feed, so `apk upgrade` keeps the theme current — which is the entire job this
+# package was written to do, done by the tool that is meant to do it. Rather than leave a dead
+# checker on every router that has one, the final release hands the theme over to the feed and
+# removes itself: root/usr/libexec/footstrap-updater-retire.sh, which explains each step and fails
+# soft at every one of them.
+#
+# DETACHED, WITH A DELAY. A package cannot uninstall itself from inside its own install transaction:
+# apk/opkg holds the database lock, so `apk del` here would block or corrupt it. setsid+& puts the
+# script outside this process so it survives postinst returning, and the script then waits for the
+# lock itself. Nothing is left running if it never gets one — it exits.
 define Package/luci-app-footstrap-updater/postinst
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] || {
 	rm -f /tmp/luci-indexcache* /tmp/luci-modulecache/* >/dev/null 2>&1 || true
 	/etc/init.d/rpcd reload >/dev/null 2>&1 || true
+	if [ -x /usr/libexec/footstrap-updater-retire.sh ]; then
+		setsid sh -c 'sleep 10; /usr/libexec/footstrap-updater-retire.sh' >/dev/null 2>&1 &
+	fi
 }
 exit 0
 endef
@@ -57,8 +71,8 @@ define Package/luci-app-footstrap-updater/postrm
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] || {
 	# Removing the updater removes fs-update.js from /www/luci-static/resources; drop the module cache
-	# so the theme's Appearance popover stops offering update controls on the next load, and reload
-	# rpcd so the file.exec grant goes away.
+	# so the theme stops loading it on the next page, and reload rpcd so the file.exec grant goes
+	# away. (A current theme no longer looks for the module at all — this keeps an older one clean.)
 	rm -f /tmp/luci-indexcache* /tmp/luci-modulecache/* >/dev/null 2>&1 || true
 	/etc/init.d/rpcd reload >/dev/null 2>&1 || true
 }

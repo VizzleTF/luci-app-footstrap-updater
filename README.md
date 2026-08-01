@@ -1,11 +1,24 @@
-# luci-app-footstrap-updater
+# luci-app-footstrap-updater — RETIRED
 
-The optional self-update package for [luci-theme-footstrap](https://github.com/VizzleTF/luci-theme-footstrap)
-on OpenWrt 24.10 (ipk) and 25.12+ (apk).
+The self-update package for [luci-theme-footstrap](https://github.com/VizzleTF/luci-theme-footstrap)
+on OpenWrt 24.10 (ipk) and 25.12+ (apk). **It is retired, and its final release uninstalls it.**
 
-It adds, to the theme's Appearance popover, a **version check** against GitHub and a **one-click
-Update** button. Without it the theme still works and shows its version — it just has no update
-controls and makes no network calls.
+It existed for one reason: a theme installed from a downloaded file is one `apk`/`opkg` knows no
+origin for and will never upgrade, so something had to check GitHub and fetch the next version. The
+theme's installer adds the [owfeed-packages](https://github.com/owfeed/owfeed-packages) feed now, so
+`apk upgrade` does that — for every package on the router, against the index signature the feed
+already carries, instead of a settings page reaching the network on every open.
+
+**Nothing to do if you have it installed.** Upgrading to the final release runs
+`footstrap-updater-retire.sh`, which adds the feed if it is missing, re-installs the theme *from*
+the feed (on apk this also clears the content-hash pin that `apk add ./file.apk` wrote into
+`/etc/apk/world` — the pin is why a file-installed theme never upgrades), and then removes this
+package. Every step fails soft: the worst allowed outcome is "the updater is still installed", and
+the removal only happens once the theme is confirmed in place. Watch it with
+`logread -e footstrap-retire`.
+
+**Installing the theme fresh?** Use the theme's installer — it adds the feed for you, and this
+package is not part of that path any more.
 
 ## What it ships
 
